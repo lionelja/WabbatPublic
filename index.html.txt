@@ -1,0 +1,2425 @@
+import { Component, OnInit, signal, computed, ChangeDetectionStrategy } from '@angular/core';
+import { CommonModule, CurrencyPipe } from '@angular/common';
+import { FormsModule } from '@angular/forms';
+import { DragDropModule, CdkDragDrop, moveItemInArray } from '@angular/cdk/drag-drop';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, signOut, onAuthStateChanged, Auth } from 'firebase/auth';
+import { getFirestore, collection, doc, setDoc, getDoc, onSnapshot, Firestore, query, where, DocumentData, arrayUnion, Unsubscribe, deleteDoc } from 'firebase/firestore';
+
+// --- Global Context Variables (Defined by Canvas Environment) ---
+declare const __app_id: string;
+declare const __firebase_config: string;
+declare const __initial_auth_token: string | undefined;
+
+// --- Interface Definitions ---
+
+interface License {
+    type: 'Free' | 'Basic' | 'Professional' | 'Enterprise';
+    price: number;
+    features: string[];
+    canSort: boolean;
+    canUseEngine: boolean;
+    canUseApi: boolean;
+}
+
+interface LicenseAssignment {
+    seatId: number;
+    email: string;
+    licenseType: License['type'];
+}
+
+interface UserProfile {
+    userId: string;
+    accountId: string;
+    organizationName: string;
+    name: string;
+    email: string;
+    isAdmin: boolean;
+    licenseType: License['type'];
+    licenseExpires: number; // Unix timestamp
+    assignedLicenses: LicenseAssignment[];
+    apiBaseUrl: string;
+    apiAuthToken: string;
+    apiEnvironment: string;
+}
+
+interface AuthState {
+    isAuthenticated: boolean;
+    isAuthReady: boolean;
+    error: string | null;
+    currentView: 'landing' | 'register' | 'login' | 'app';
+    name: string;
+    email: string;
+    password: string;
+    organizationName: string;
+    selectedLicenseType: License['type'];
+    licensesToPurchase: number;
+    licenseEmails: { email: string, licenseType: License['type'] }[];
+    isAdditionalPurchase: boolean;
+}
+
+interface DataRow extends DocumentData {
+    id: string;
+    [key: string]: any;
+}
+
+interface ColumnConfig {
+    name: string;
+    isVisible: boolean;
+    isUniqueKey: boolean;
+    isSortAsc: boolean | null; // true for ASC, false for DESC, null for none
+    sortOrder: number; // 0 for primary sort, 1 for secondary, etc.
+}
+
+interface RuleCondition {
+    column: string;
+    operator: string;
+    value: string;
+    logic: 'AND' | 'OR';
+}
+
+interface RuleAction {
+    targetColumn: string;
+    value: string; // Can be a literal value or an algorithm formula
+}
+
+interface TransformationRule {
+    id: string;
+    name: string;
+    conditions: RuleCondition[];
+    actions: RuleAction[];
+}
+
+interface ApiConfig {
+    id: string;
+    columnName: string;
+    apiName: string;
+    mapToColumn: string;
+}
+
+interface Testimonial {
+    id: string;
+    userId: string;
+    organizationName: string;
+    content: string;
+    isApproved: boolean;
+    timestamp: number;
+}
+
+interface DetailModalState {
+    isOpen: boolean;
+    row: DataRow | null;
+    tab: 'detail' | 'api';
+    apiResponse: string;
+    apiConfig: ApiConfig | null; // Added apiConfig here
+}
+
+// --- Component Definition ---
+
+@Component({
+    selector: 'app-root',
+    standalone: true,
+    imports: [CommonModule, FormsModule, DragDropModule, CurrencyPipe],
+    template: `
+        <style>
+            .app-container {
+                min-height: 100vh;
+                display: flex;
+                flex-direction: column;
+                background: linear-gradient(to right, #f8fafc, #e2e8f0); /* Light gradient background */
+                font-family: 'Inter', sans-serif;
+            }
+            .data-grid-container {
+                overflow-x: auto;
+                max-width: 100vw;
+            }
+            .data-grid {
+                border-collapse: separate;
+                border-spacing: 0;
+                min-width: 100%;
+                table-layout: fixed;
+            }
+            .data-grid th, .data-grid td {
+                padding: 12px 16px;
+                border: 1px solid #e2e8f0;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            .data-grid th {
+                background-color: #3f3f46;
+                color: white;
+                cursor: pointer;
+                user-select: none;
+                position: sticky;
+                top: 0;
+                z-index: 10;
+            }
+            .data-grid tbody tr:hover {
+                background-color: #f1f5f9;
+            }
+            .editable-cell input {
+                width: 100%;
+                height: 100%;
+                border: none;
+                background-color: transparent;
+                padding: 0;
+                margin: 0;
+                outline: none;
+            }
+            .modal-overlay {
+                position: fixed;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 100%;
+                background-color: rgba(0, 0, 0, 0.6);
+                z-index: 50;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                backdrop-filter: blur(4px);
+            }
+            .payment-modal-content, .detail-modal-content {
+                background-color: white;
+                border-radius: 12px;
+                box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.2), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+                padding: 32px;
+                max-width: 90%;
+                max-height: 90vh;
+                overflow-y: auto;
+                z-index: 51;
+            }
+            .grid-tab-content {
+                height: calc(100vh - 120px); /* Adjust based on header height */
+                overflow-y: auto;
+                padding: 16px;
+            }
+            .org-admin-grid th {
+                background-color: #f1f5f9;
+                color: #1e293b;
+            }
+            .testimonial-carousel {
+                display: flex;
+                overflow-x: scroll;
+                scroll-snap-type: x mandatory;
+                -webkit-overflow-scrolling: touch;
+                padding: 16px 0;
+            }
+            .testimonial-card {
+                flex: 0 0 90%;
+                scroll-snap-align: start;
+                background: white;
+                border-radius: 10px;
+                box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+                margin-right: 16px;
+                padding: 24px;
+            }
+            @media (min-width: 768px) {
+                .testimonial-card {
+                    flex: 0 0 30%;
+                }
+            }
+            /* Custom CSS for Drag Handles */
+            .drag-handle {
+                cursor: grab;
+                color: #94a3b8;
+                width: 20px;
+                text-align: center;
+                padding-right: 8px;
+            }
+            .cdk-drag-placeholder {
+                opacity: 0;
+            }
+            .cdk-drag-animating {
+                transition: transform 250ms cubic-bezier(0, 0, 0.2, 1);
+            }
+            .cdk-drag-preview {
+                box-sizing: border-box;
+                border-radius: 4px;
+                box-shadow: 0 5px 5px -3px rgba(0, 0, 0, 0.2),
+                            0 8px 10px 1px rgba(0, 0, 0, 0.14),
+                            0 3px 14px 2px rgba(0, 0, 0, 0.12);
+                background: #f1f5f9;
+                padding: 12px 16px;
+                display: flex;
+                justify-content: flex-start;
+                align-items: center;
+                color: #1e293b;
+            }
+        </style>
+
+        <div class="app-container">
+
+            <!-- Global Loading and Custom Modal -->
+            <div *ngIf="isLoading()" class="modal-overlay">
+                <div class="bg-white p-6 rounded-xl shadow-2xl flex items-center">
+                    <svg class="animate-spin -ml-1 mr-3 h-5 w-5 text-indigo-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                    </svg>
+                    <span class="text-gray-700 font-medium">{{ loadingMessage() }}</span>
+                </div>
+            </div>
+
+            <!-- PAYMENT MODAL -->
+            <div *ngIf="paymentModalOpen()" class="modal-overlay">
+                <div class="payment-modal-content max-w-xl w-full">
+                    <h2 class="text-3xl font-bold text-indigo-600 mb-6">Complete Purchase: {{ selectedLicenseDetails().type }} License(s)</h2>
+
+                    <!-- License Summary -->
+                    <div class="p-4 bg-indigo-50 rounded-lg mb-6 border border-indigo-200">
+                        <p class="text-lg font-medium text-indigo-800 mb-1">
+                            Organization: <span class="font-bold">{{ authState().organizationName }}</span>
+                        </p>
+                        <p class="text-lg font-medium text-indigo-800">
+                            Licenses Purchased: <span class="font-bold">{{ licensesToPurchase() }}</span>
+                        </p>
+                        <p class="text-2xl font-extrabold text-indigo-800">
+                            Total Price: {{ selectedLicenseDetails().price * licensesToPurchase() | currency:'USD':'symbol':'1.2-2' }}
+                        </p>
+                    </div>
+
+                    <h3 class="text-xl font-semibold text-gray-700 mb-4">Payment Information (Mock)</h3>
+                    
+                    <div class="space-y-4">
+                        <div class="flex items-center space-x-4">
+                            <input type="radio" id="visa" name="paymentOption" [value]="'Visa'" checked class="text-indigo-600 focus:ring-indigo-500">
+                            <label for="visa" class="flex items-center text-gray-700 font-medium">
+                                <svg class="w-6 h-6 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h18M3 14h18m-9-4v8m-7 0h14a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                                Visa / Mastercard
+                            </label>
+                            <input type="radio" id="paypal" name="paymentOption" [value]="'PayPal'" class="text-indigo-600 focus:ring-indigo-500">
+                            <label for="paypal" class="flex items-center text-gray-700 font-medium">
+                                <svg class="w-6 h-6 mr-1" fill="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M12.001 0C6.398 0 1.996 4.477 1.996 9.998c0 5.097 3.522 9.349 8.243 9.873.601.109.822-.262.822-.582 0-.287-.011-1.045-.017-2.051-3.411.75-4.131-1.642-4.131-1.642-.558-1.411-1.36-1.788-1.36-1.788-1.11-.758.083-.742.083-.742 1.226.086 1.874 1.261 1.874 1.261 1.088 1.866 2.859 1.326 3.549 1.015.11-.787.426-1.326.775-1.631-2.716-.307-5.583-1.358-5.583-6.03 0-1.33.475-2.421 1.251-3.275-.125-.308-.542-1.549.119-3.23 0 0 1.018-.328 3.332 1.258a11.53 11.53 0 013.064-.413c1.03.003 2.062.139 3.064.413 2.313-1.586 3.332-1.258 3.332-1.258.662 1.681.246 2.922.12 3.23.774.854 1.25 1.944 1.25 3.275 0 4.683-2.87 5.72-5.59 6.022.44.38.835 1.102.835 2.22 0 1.604-.015 2.894-.015 3.292 0 .32.222.696.829.579C19.479 19.347 23 15.095 23 9.998 23 4.477 18.598 0 12.001 0z"/></svg>
+                                PayPal
+                            </label>
+                        </div>
+                        <input type="text" placeholder="Card Number (Mock)" class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                        <div class="flex space-x-4">
+                            <input type="text" placeholder="MM/YY (Mock)" class="w-1/2 p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                            <input type="text" placeholder="CVC (Mock)" class="w-1/2 p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                        </div>
+                    </div>
+                    
+                    <div class="mt-8 flex justify-between space-x-4">
+                        <button (click)="paymentModalOpen.set(false)" class="px-6 py-3 border border-gray-300 rounded-lg font-bold text-gray-700 hover:bg-gray-100 transition">Cancel</button>
+                        <button 
+                            (click)="processPaymentAndRegister()" 
+                            class="px-6 py-3 bg-green-600 text-white font-bold rounded-lg shadow-md hover:bg-green-700 transition">
+                            Finalize Purchase & Get Access
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- DETAIL / REST API MODAL -->
+            <div *ngIf="detailModal().isOpen" class="modal-overlay">
+                <div class="detail-modal-content max-w-2xl w-full">
+                    <h2 class="text-2xl font-bold text-indigo-600 mb-4">Row Detail Viewer (ID: {{ detailModal().row?.id }})</h2>
+                    
+                    <!-- Tabs -->
+                    <ul class="flex flex-wrap -mb-px">
+                        <li class="mr-2">
+                            <button (click)="setDetailModalTab('detail')"
+                                [class]="{
+                                    'inline-block p-4 border-b-2': true,
+                                    'text-indigo-600 border-indigo-600 font-semibold': detailModal().tab === 'detail',
+                                    'border-transparent hover:text-gray-600 hover:border-gray-300': detailModal().tab !== 'detail'
+                                }">
+                                Data Fields
+                            </button>
+                        </li>
+                        <li class="mr-2">
+                            <button (click)="setDetailModalTab('api')"
+                                [class]="{
+                                    'inline-block p-4 border-b-2': true,
+                                    'text-indigo-600 border-indigo-600 font-semibold': detailModal().tab === 'api',
+                                    'border-transparent hover:text-gray-600 hover:border-gray-300': detailModal().tab !== 'api'
+                                }">
+                                REST API Lookup
+                            </button>
+                        </li>
+                    </ul>
+
+                    <div class="p-4 border border-gray-200 rounded-b-lg mt-0 bg-white">
+                        <!-- Detail Tab Content -->
+                        <div *ngIf="detailModal().tab === 'detail'" class="space-y-3">
+                            <div *ngIf="detailModal().row as row">
+                                <div *ngFor="let col of visibleColumns()" class="flex justify-between py-1 border-b border-gray-100">
+                                    <span class="font-medium text-gray-600">{{ col.name }}:</span>
+                                    <span class="text-gray-800">{{ row[col.name] }}</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- API Tab Content -->
+                        <div *ngIf="detailModal().tab === 'api'" class="space-y-4">
+                            <select 
+                                name="apiLookupColumn"
+                                [ngModel]="detailModal().apiConfig?.columnName || ''" 
+                                (ngModelChange)="setApiLookupColumn($event)"
+                                class="w-full p-2 border border-gray-300 rounded-lg text-sm">
+                                <option value="" disabled>Select Column for API Lookup...</option>
+                                <option *ngFor="let config of apiConfigList()" [value]="config.columnName">
+                                    {{ config.columnName }} (via API: {{ config.apiName }})
+                                </option>
+                            </select>
+
+                            <div *ngIf="detailModal().apiConfig" class="p-3 bg-yellow-50 rounded-lg text-sm text-yellow-800">
+                                API: **{{ detailModal().apiConfig.apiName }}** | Value to Send: **{{ detailModal().row ? detailModal().row[detailModal().apiConfig.columnName] : 'N/A' }}**
+                            </div>
+
+                            <button 
+                                (click)="runSingleRowApiLookup()" 
+                                [disabled]="!detailModal().apiConfig || isLoading()"
+                                class="w-full py-2 bg-indigo-500 text-white font-bold rounded-lg hover:bg-indigo-600 transition disabled:opacity-50">
+                                Run API Lookup
+                            </button>
+
+                            <div *ngIf="detailModal().apiResponse" class="mt-4">
+                                <h4 class="font-semibold text-gray-700 mb-2">API Response (JSON):</h4>
+                                <pre class="bg-gray-100 p-3 rounded-lg overflow-x-auto text-sm max-h-60">{{ detailModal().apiResponse }}</pre>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="mt-6 text-right">
+                        <button (click)="closeDetailModal()" class="px-6 py-3 border border-gray-300 rounded-lg font-bold text-gray-700 hover:bg-gray-100 transition">Close</button>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- BULK API RESULT MODAL -->
+            <div *ngIf="bulkApiModalOpen()" class="modal-overlay">
+                <div class="detail-modal-content max-w-4xl w-full">
+                    <h2 class="text-2xl font-bold text-indigo-600 mb-4">Batch API Results ({{ bulkApiResults().length }} Results)</h2>
+                    
+                    <div class="space-y-4 max-h-[70vh] overflow-y-auto">
+                        <div *ngIf="!bulkApiResults().length" class="p-4 bg-yellow-100 rounded-lg text-yellow-800">No batch API results available.</div>
+
+                        <div *ngFor="let result of bulkApiResults(); let i = index" 
+                             class="p-4 border border-gray-300 rounded-lg shadow-sm bg-white">
+                            <h3 class="font-bold text-lg text-indigo-700 mb-2">Result for Value: "{{ result.inputValue }}" (Row ID: {{ result.rowId }})</h3>
+                            <pre class="bg-gray-50 p-3 rounded-lg overflow-x-auto text-sm max-h-40">{{ result.responseJson }}</pre>
+                        </div>
+                    </div>
+
+                    <div class="mt-6 text-right">
+                        <button (click)="bulkApiModalOpen.set(false)" class="px-6 py-3 border border-gray-300 rounded-lg font-bold text-gray-700 hover:bg-gray-100 transition">Close All Results</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- HEADER -->
+            <header class="bg-white shadow-md p-4 flex justify-between items-center z-20">
+                <div class="flex items-center space-x-4">
+                    <h1 class="text-2xl font-extrabold text-indigo-800 tracking-tight">Wabbat</h1>
+                    <span class="text-sm text-gray-500 hidden sm:inline">Configuration Manager for UKG PRO WFM</span>
+                </div>
+                
+                <div *ngIf="isAppView()" class="flex items-center space-x-4">
+                    <span class="text-sm text-gray-600 font-medium hidden sm:inline">
+                        User: {{ currentProfile().email }} ({{ currentProfile().licenseType }})
+                    </span>
+                    <button (click)="logout()" class="px-4 py-2 bg-red-500 text-white rounded-lg shadow-md hover:bg-red-600 transition text-sm font-semibold">
+                        Logout
+                    </button>
+                </div>
+            </header>
+
+            <!-- LANDING PAGE -->
+            <div *ngIf="isLandingView()" class="p-8 flex-grow">
+                <div class="max-w-6xl mx-auto space-y-12">
+                    <!-- Hero Section -->
+                    <div class="flex flex-col lg:flex-row items-center bg-white p-10 rounded-2xl shadow-xl space-y-8 lg:space-y-0 lg:space-x-12">
+                        <div class="lg:w-1/2 space-y-6">
+                            <h2 class="text-5xl font-extrabold text-gray-900 leading-tight">
+                                Automate UKG Config Edits with <span class="text-indigo-600">Wabbat Rule Sets</span>
+                            </h2>
+                            <p class="text-xl text-gray-600">
+                                Wabbat is the essential configuration management tool for UKG PRO WFM and PRO Suite customers. Stop manual data entry and start managing configurations using complex **IF/THEN Rule Sets** for single or batch field edits.
+                            </p>
+                            <div class="pt-4 space-x-4">
+                                <button (click)="navigateTo('login')" class="px-8 py-3 bg-indigo-600 text-white text-lg font-bold rounded-lg shadow-lg hover:bg-indigo-700 transition transform hover:scale-105">
+                                    Login
+                                </button>
+                                <button (click)="navigateTo('register')" class="px-8 py-3 bg-gray-200 text-indigo-600 text-lg font-bold rounded-lg shadow-lg hover:bg-gray-300 transition transform hover:scale-105">
+                                    Register Now
+                                </button>
+                            </div>
+                        </div>
+                        <div class="lg:w-1/2 flex justify-center">
+                            <img src="https://placehold.co/600x350/a5b4fc/ffffff?text=Wabbat+App+Interface+GIF" alt="Wabbat App Interface" class="rounded-xl shadow-2xl border-4 border-indigo-200" />
+                        </div>
+                    </div>
+
+                    <!-- Promo & Licensing Section -->
+                    <div class="bg-indigo-700 p-8 rounded-2xl text-white shadow-xl">
+                        <h3 class="text-3xl font-bold mb-3 text-yellow-300">
+                            🚨 Post-Aspire 2025 Special!
+                        </h3>
+                        <p class="text-xl font-semibold mb-6">
+                            Purchase one license and **get five licenses free**! Promotion ends 12/31/2025.
+                        </p>
+
+                        <h3 class="text-3xl font-bold mb-6 border-b border-indigo-400 pb-2">Licensing Options</h3>
+                        <div class="grid grid-cols-1 md:grid-cols-4 gap-6">
+                            <!-- License Card: Free -->
+                            <div class="bg-white text-gray-800 p-6 rounded-xl shadow-lg border-t-4 border-gray-400">
+                                <h4 class="text-2xl font-bold mb-2">Free</h4>
+                                <p class="text-4xl font-extrabold mb-4">$0.00</p>
+                                <ul class="space-y-2 text-sm">
+                                    <li class="flex items-center"><svg class="w-5 h-5 mr-2 text-green-500" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd"></path></svg>Data Grid & Sort</li>
+                                    <li class="flex items-center"><svg class="w-5 h-5 mr-2 text-green-500" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd"></path></svg>File Import/Export (JSON)</li>
+                                    <li class="flex items-center text-red-500"><svg class="w-5 h-5 mr-2" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clip-rule="evenodd"></path></svg>IF/THEN Engine</li>
+                                </ul>
+                            </div>
+                            <!-- License Card: Basic -->
+                            <div class="bg-white text-gray-800 p-6 rounded-xl shadow-lg border-t-4 border-yellow-500">
+                                <h4 class="text-2xl font-bold mb-2">Basic</h4>
+                                <p class="text-4xl font-extrabold mb-4">$299.99/yr</p>
+                                <ul class="space-y-2 text-sm">
+                                    <li class="flex items-center"><svg class="w-5 h-5 mr-2 text-green-500" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd"></path></svg>Data Sort & Row Edit</li>
+                                    <li class="flex items-center"><svg class="w-5 h-5 mr-2 text-green-500" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd"></path></svg>Row Insert/Replicate</li>
+                                    <li class="flex items-center text-red-500"><svg class="w-5 h-5 mr-2" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clip-rule="evenodd"></path></svg>IF/THEN Engine</li>
+                                </ul>
+                            </div>
+                            <!-- License Card: Professional -->
+                            <div class="bg-white text-gray-800 p-6 rounded-xl shadow-lg border-t-4 border-indigo-500">
+                                <h4 class="text-2xl font-bold mb-2">Professional</h4>
+                                <p class="text-4xl font-extrabold mb-4">$499.99/yr</p>
+                                <ul class="space-y-2 text-sm">
+                                    <li class="flex items-center"><svg class="w-5 h-5 mr-2 text-green-500" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd"></path></svg>IF/THEN Engine</li>
+                                    <li class="flex items-center"><svg class="w-5 h-5 mr-2 text-green-500" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd"></path></svg>Rule Library Save/Load</li>
+                                    <li class="flex items-center text-red-500"><svg class="w-5 h-5 mr-2" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clip-rule="evenodd"></path></svg>REST API Connection</li>
+                                </ul>
+                            </div>
+                            <!-- License Card: Enterprise -->
+                            <div class="bg-white text-gray-800 p-6 rounded-xl shadow-lg border-t-4 border-red-500">
+                                <h4 class="text-2xl font-bold mb-2">Enterprise</h4>
+                                <p class="text-4xl font-extrabold mb-4">$999.99/yr</p>
+                                <ul class="space-y-2 text-sm">
+                                    <li class="flex items-center"><svg class="w-5 h-5 mr-2 text-green-500" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd"></path></svg>IF/THEN Engine</li>
+                                    <li class="flex items-center"><svg class="w-5 h-5 mr-2 text-green-500" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd"></path></svg>Where Used Search</li>
+                                    <li class="flex items-center"><svg class="w-5 h-5 mr-2 text-green-500" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd"></path></svg>SSO & REST API</li>
+                                </ul>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Testimonials Section -->
+                    <div class="space-y-6">
+                        <h3 class="text-3xl font-bold text-gray-800 border-b pb-2">What Customers Say</h3>
+                        <div *ngIf="approvedTestimonials().length > 0" class="testimonial-carousel">
+                            <div *ngFor="let t of approvedTestimonials()" class="testimonial-card">
+                                <p class="text-gray-700 italic mb-4">"{{ t.content }}"</p>
+                                <p class="font-semibold text-indigo-600">— {{ t.organizationName }}</p>
+                            </div>
+                        </div>
+                        <div *ngIf="approvedTestimonials().length === 0" class="p-4 bg-gray-100 rounded-lg text-gray-600">
+                            Be the first to leave a testimonial!
+                        </div>
+                    </div>
+
+                    <!-- Footer / Legal -->
+                    <footer class="text-center text-sm text-gray-500 pt-8 border-t border-gray-200">
+                        <p>&copy; 2024 Wabbat Configuration Manager. All rights reserved.</p>
+                        <p>SSO sign-in requires Enterprise license and existing corporate identity management integration.</p>
+                    </footer>
+                </div>
+            </div>
+
+            <!-- LOGIN/REGISTER PAGE -->
+            <div *ngIf="isAuthView()" class="flex-grow flex items-center justify-center p-4">
+                <div class="bg-white p-8 rounded-2xl shadow-2xl w-full max-w-lg">
+                    <h2 class="text-3xl font-bold text-indigo-600 mb-2">{{ isLoginView() ? 'Sign In to Wabbat' : (authState().isAdditionalPurchase ? 'Purchase Additional Licenses' : 'New Account Registration') }}</h2>
+                    <p class="text-gray-500 mb-6">{{ isLoginView() ? 'Enter your credentials to access the tool.' : 'Secure your licenses and complete your account setup.' }}</p>
+
+                    <form #authForm="ngModel" (ngSubmit)="handleAuthSubmit(authForm)">
+                        <div *ngIf="authState().error" class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative mb-4" role="alert">
+                            <span class="block sm:inline">{{ authState().error }}</span>
+                        </div>
+
+                        <!-- Registration Fields (Non-Admin users skip these) -->
+                        <div *ngIf="isRegisterView() && !authState().isAdditionalPurchase" class="space-y-4 mb-6">
+                            <input type="text" placeholder="Your Full Name (Admin)" name="name" [ngModel]="authState().name" (ngModelChange)="updateAuthField('name', $event)" required class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                            <input type="text" placeholder="Organization Name" name="orgName" [ngModel]="authState().organizationName" (ngModelChange)="updateAuthField('organizationName', $event)" required class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                            
+                            <select name="selectedLicenseType" [ngModel]="authState().selectedLicenseType" (ngModelChange)="updateLicenseDetails($event)" required class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                                <option value="" disabled>Select License Type...</option>
+                                <option *ngFor="let key of licenseTypes" [value]="key">{{ getLicenseOptionText(key) }}</option>
+                            </select>
+                            
+                            <input type="number" name="licensesToPurchase" [ngModel]="licensesToPurchase()" (ngModelChange)="updateLicensesToPurchase($event)" [min]="1" required class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                            
+                            <div class="p-3 bg-indigo-50 rounded-lg">
+                                <p class="font-semibold text-sm text-indigo-800">License 1 (Admin Seat)</p>
+                                <input type="email" placeholder="Primary Admin Email" name="email" [ngModel]="authState().email" (ngModelChange)="updateAuthField('email', $event)" required class="w-full p-2 mt-1 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500" [disabled]="!!authState().isAdditionalPurchase">
+                            </div>
+                        </div>
+
+                        <!-- Additional Purchase Fields -->
+                        <div *ngIf="isRegisterView() && authState().isAdditionalPurchase" class="space-y-4 mb-6">
+                            <h3 class="text-xl font-semibold text-gray-700">Licenses to Purchase:</h3>
+                            <input type="number" name="licensesToPurchase" [ngModel]="licensesToPurchase()" (ngModelChange)="updateLicensesToPurchase($event)" [min]="1" required class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                        </div>
+                        
+                        <!-- Email and Password Fields (Common to both) -->
+                        <div class="space-y-4 mb-6">
+                            <div class="space-y-2" *ngFor="let license of licensesToPurchaseArray(); let i = index">
+                                <label class="font-medium text-gray-700 text-sm">Seat {{ license.seatIndex }}: Email Address</label>
+                                <input 
+                                    [name]="'licenseEmail_' + license.seatIndex"
+                                    type="email" 
+                                    [placeholder]="'Seat ' + license.seatIndex + ' Email Address'" 
+                                    [ngModel]="licenseEmails()[i].email" 
+                                    (ngModelChange)="updateLicenseEmail(i, 'email', $event)"
+                                    required 
+                                    class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500"
+                                >
+                                <!-- License Type Radio Buttons -->
+                                <div class="flex items-center space-x-3 mt-1">
+                                    <span class="text-sm font-medium text-gray-500 mr-2">License:</span>
+                                    <div *ngFor="let type of licenseTypes" class="flex items-center">
+                                        <input 
+                                            [id]="'seat' + license.seatIndex + '-' + type" 
+                                            [name]="'licenseType_' + license.seatIndex" 
+                                            type="radio" 
+                                            [value]="type"
+                                            [ngModel]="licenseEmails()[i].licenseType"
+                                            (ngModelChange)="updateLicenseEmail(i, 'licenseType', $event)"
+                                            class="w-4 h-4 text-indigo-600 focus:ring-indigo-500"
+                                            [required]="true"
+                                        >
+                                        <label [for]="'seat' + license.seatIndex + '-' + type" class="ml-1 text-sm font-medium text-gray-700">{{ type }}</label>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Password Field -->
+                            <input type="password" placeholder="Password" name="password" [ngModel]="authState().password" (ngModelChange)="updateAuthField('password', $event)" required class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                        </div>
+
+                        <button 
+                            type="submit" 
+                            [disabled]="authForm.invalid || isLoading()" 
+                            class="w-full py-3 bg-indigo-600 text-white font-bold rounded-lg shadow-md hover:bg-indigo-700 transition disabled:opacity-50">
+                            {{ isLoginView() ? 'Sign In' : 'Complete Registration & Purchase' }}
+                        </button>
+                    </form>
+
+                    <div class="mt-6 text-center text-sm">
+                        <button *ngIf="isLoginView()" (click)="navigateTo('register')" class="text-indigo-600 hover:text-indigo-800 font-semibold">
+                            Need an account? Register Now
+                        </button>
+                        <button *ngIf="isRegisterView()" (click)="navigateTo('login')" class="text-indigo-600 hover:text-indigo-800 font-semibold">
+                            Already registered? Sign In
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- MAIN APPLICATION VIEW -->
+            <div *ngIf="isAppView()" class="flex-grow p-4 bg-white shadow-inner">
+                
+                <!-- Tab Navigation -->
+                <nav class="border-b border-gray-200 mb-4">
+                    <ul class="flex flex-wrap -mb-px text-sm font-medium text-center">
+                        <li class="mr-2">
+                            <button (click)="mainTab.set('my-profile')" [class]="tabClass('my-profile')">My Profile</button>
+                        </li>
+                        <li class="mr-2">
+                            <button (click)="mainTab.set('data-grid')" [class]="tabClass('data-grid')">Data Grid ({{ dataRows().length }} rows)</button>
+                        </li>
+                        <li class="mr-2">
+                            <button [disabled]="!canUseEngine()" (click)="mainTab.set('engine')" [class]="tabClass('engine')">IF/THEN Transformation Engine</button>
+                        </li>
+                        <li class="mr-2">
+                            <button [disabled]="!canUseApi()" (click)="mainTab.set('api-config')" [class]="tabClass('api-config')">API Cross-Reference</button>
+                        </li>
+                        <li class="mr-2">
+                            <button [disabled]="!currentProfile().isAdmin" (click)="mainTab.set('org-admin')" [class]="tabClass('org-admin')">Organization Admin</button>
+                        </li>
+                        <li class="mr-2">
+                            <button (click)="mainTab.set('support')" [class]="tabClass('support')">Support & Feedback</button>
+                        </li>
+                    </ul>
+                </nav>
+
+                <!-- Tab Content -->
+                <div class="grid-tab-content">
+                    
+                    <!-- My Profile Tab -->
+                    <div *ngIf="mainTab() === 'my-profile'" class="space-y-6">
+                        <h2 class="text-3xl font-bold text-gray-800">My Profile Details</h2>
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-6 bg-gray-50 p-6 rounded-xl border">
+                            <div><span class="font-semibold text-gray-600">Full Name:</span> <span class="font-bold text-gray-800">{{ currentProfile().name }}</span></div>
+                            <div><span class="font-semibold text-gray-600">Primary Email:</span> <span class="font-bold text-gray-800">{{ currentProfile().email }}</span></div>
+                            <div><span class="font-semibold text-gray-600">User ID:</span> <span class="font-bold text-gray-800 break-all">{{ currentProfile().userId }}</span></div>
+                            <div><span class="font-semibold text-gray-600">Assigned License:</span> <span [class]="'font-bold ' + licenseColor(currentProfile().licenseType)">{{ currentProfile().licenseType }}</span></div>
+                        </div>
+                    </div>
+
+                    <!-- Organization Admin Tab -->
+                    <div *ngIf="mainTab() === 'org-admin'" class="space-y-8">
+                        <h2 class="text-3xl font-bold text-indigo-800">Organization Administration</h2>
+                        
+                        <!-- Account Summary -->
+                        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 bg-indigo-50 p-6 rounded-xl border border-indigo-200">
+                            <div><span class="font-semibold text-indigo-700">Account ID:</span> <span class="font-bold text-indigo-900">{{ currentProfile().accountId }}</span></div>
+                            <div><span class="font-semibold text-indigo-700">Organization:</span> <span class="font-bold text-indigo-900">{{ currentProfile().organizationName }}</span></div>
+                            <div><span class="font-semibold text-indigo-700">Licenses:</span> <span class="font-bold text-indigo-900">{{ currentProfile().assignedLicenses.length }} / {{ currentProfile().assignedLicenses.length }} Assigned</span></div>
+                        </div>
+
+                        <!-- License Management -->
+                        <div class="space-y-4 p-6 bg-white rounded-xl shadow">
+                            <div class="flex justify-between items-center border-b pb-2 mb-4">
+                                <h3 class="text-xl font-semibold text-gray-700">Assigned Licenses</h3>
+                                <button (click)="navigateTo('register'); authState.update(s => ({...s, isAdditionalPurchase: true}))" class="px-4 py-2 bg-green-600 text-white rounded-lg shadow-md hover:bg-green-700 transition text-sm font-semibold">
+                                    Purchase More Licenses
+                                </button>
+                            </div>
+                            <table class="w-full text-left org-admin-grid text-sm">
+                                <thead>
+                                    <tr>
+                                        <th class="w-16">Seat</th>
+                                        <th class="w-1/3">Email Address</th>
+                                        <th class="w-1/4">License Type</th>
+                                        <th class="w-1/4">Status</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <tr *ngFor="let license of currentProfile().assignedLicenses; let i = index" class="border-t">
+                                        <td class="font-bold">{{ license.seatId }}</td>
+                                        <td class="break-all">{{ license.email }} <span *ngIf="license.email === currentProfile().email" class="text-xs font-semibold px-2 py-0.5 bg-yellow-100 text-yellow-800 rounded-full ml-2">Admin</span></td>
+                                        <td [class]="licenseColor(license.licenseType)">{{ license.licenseType }}</td>
+                                        <td>Active</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <!-- API Connection Settings -->
+                        <div *ngIf="canUseApi()" class="space-y-4 p-6 bg-white rounded-xl shadow">
+                            <h3 class="text-xl font-semibold text-gray-700 border-b pb-2 mb-4">API Connection Settings</h3>
+                            <div class="space-y-4">
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700">Base API URL (v2 endpoints)</label>
+                                    <input type="text" name="apiBaseUrl" [ngModel]="currentProfile().apiBaseUrl" (ngModelChange)="updateProfileField('apiBaseUrl', $event)" class="w-full p-3 border border-gray-300 rounded-lg" placeholder="https://api.ukgpro.com/v2/...">
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700">Authentication Token (Bearer)</label>
+                                    <input type="password" name="apiAuthToken" [ngModel]="currentProfile().apiAuthToken" (ngModelChange)="updateProfileField('apiAuthToken', $event)" class="w-full p-3 border border-gray-300 rounded-lg" placeholder="Enter Bearer Token (e.g., JWT)">
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700">Target Environment</label>
+                                    <select name="apiEnvironment" [ngModel]="currentProfile().apiEnvironment" (ngModelChange)="updateProfileField('apiEnvironment', $event)" class="w-full p-3 border border-gray-300 rounded-lg">
+                                        <option value="prod">Production</option>
+                                        <option value="staging">Staging</option>
+                                        <option value="sandbox">Sandbox/Development</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div class="pt-4">
+                                <button (click)="saveProfileChanges()" class="px-6 py-2 bg-indigo-500 text-white font-bold rounded-lg hover:bg-indigo-600 transition">Save API Config</button>
+                            </div>
+                        </div>
+
+                        <!-- Testimonial Moderation -->
+                        <div class="space-y-4 p-6 bg-white rounded-xl shadow">
+                            <h3 class="text-xl font-semibold text-gray-700 border-b pb-2 mb-4">Testimonial Moderation ({{ pendingTestimonials().length }} Pending)</h3>
+                            <div *ngIf="!pendingTestimonials().length" class="p-3 bg-green-100 rounded-lg text-green-800">
+                                No testimonials pending approval.
+                            </div>
+                            <div *ngFor="let t of pendingTestimonials()" class="p-3 border border-gray-200 rounded-lg flex justify-between items-center space-x-4">
+                                <div>
+                                    <p class="italic text-gray-700">"{{ t.content }}"</p>
+                                    <p class="text-sm font-medium text-indigo-600">— {{ t.organizationName }}</p>
+                                </div>
+                                <div class="flex space-x-2">
+                                    <button (click)="approveTestimonial(t.id)" class="px-4 py-2 bg-green-500 text-white rounded-lg text-sm hover:bg-green-600">Approve</button>
+                                    <button (click)="deleteTestimonial(t.id)" class="px-4 py-2 bg-red-500 text-white rounded-lg text-sm hover:bg-red-600">Reject</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Support & Feedback Tab -->
+                    <div *ngIf="mainTab() === 'support'" class="space-y-6">
+                        <h2 class="text-3xl font-bold text-gray-800">Support & Feedback</h2>
+                        
+                        <!-- Submit Testimonial Form -->
+                        <div class="p-6 bg-white rounded-xl shadow space-y-4 border border-gray-200">
+                            <h3 class="text-xl font-semibold text-indigo-700">Submit Testimonial</h3>
+                            <textarea 
+                                name="testimonialContent"
+                                [(ngModel)]="newTestimonialContent"
+                                rows="4" 
+                                placeholder="Share your experience with Wabbat (required)" 
+                                class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500"
+                            ></textarea>
+                            <button 
+                                (click)="submitTestimonial()" 
+                                [disabled]="!newTestimonialContent.trim() || isLoading()" 
+                                class="px-6 py-2 bg-indigo-600 text-white font-bold rounded-lg hover:bg-indigo-700 transition disabled:opacity-50">
+                                Submit Feedback for Approval
+                            </button>
+                            <div *ngIf="submissionMessage" class="mt-3 p-3 text-sm rounded-lg" [ngClass]="{'bg-green-100 text-green-800': submissionMessage.includes('Thank you'), 'bg-red-100 text-red-800': submissionMessage.includes('Error')}">{{ submissionMessage }}</div>
+                        </div>
+
+                        <!-- Your Submitted Testimonials -->
+                        <div class="space-y-4 p-6 bg-white rounded-xl shadow">
+                            <h3 class="text-xl font-semibold text-gray-700 border-b pb-2 mb-4">Your Submitted Feedback</h3>
+                            <div *ngIf="userTestimonials().length === 0" class="p-3 bg-gray-100 rounded-lg text-gray-600">
+                                You have not submitted any testimonials yet.
+                            </div>
+                            <div *ngFor="let t of userTestimonials()" class="p-3 border border-gray-200 rounded-lg">
+                                <p class="italic text-gray-700 mb-2">"{{ t.content }}"</p>
+                                <span *ngIf="t.isApproved" class="text-xs font-semibold px-2 py-0.5 bg-green-100 text-green-800 rounded-full">Approved</span>
+                                <span *ngIf="!t.isApproved" class="text-xs font-semibold px-2 py-0.5 bg-yellow-100 text-yellow-800 rounded-full">Pending Review</span>
+                            </div>
+                        </div>
+                    </div>
+
+
+                    <!-- Data Grid Tab -->
+                    <div *ngIf="mainTab() === 'data-grid'" class="space-y-4">
+                        <div class="flex flex-wrap items-center space-y-2 md:space-y-0 md:space-x-4 mb-4">
+                            <!-- Import/Export Buttons -->
+                            <button (click)="importJsonFile()" class="px-4 py-2 bg-indigo-600 text-white rounded-lg shadow hover:bg-indigo-700 transition">Import JSON File</button>
+                            <button (click)="exportJsonFile()" class="px-4 py-2 bg-indigo-600 text-white rounded-lg shadow hover:bg-indigo-700 transition">Export Results (JSON)</button>
+                            
+                            <!-- API Import/Export (Enterprise Feature) -->
+                            <ng-container *ngIf="canUseApi()">
+                                <button (click)="importDataFromApi()" class="px-4 py-2 bg-blue-600 text-white rounded-lg shadow hover:bg-blue-700 transition">Import Data via REST API</button>
+                                <button (click)="exportDataToApi()" class="px-4 py-2 bg-blue-600 text-white rounded-lg shadow hover:bg-blue-700 transition">Export Data via REST API</button>
+                            </ng-container>
+
+                            <!-- Data Manipulation Buttons -->
+                            <button (click)="addRow(null)" [disabled]="!dataRows().length" class="px-4 py-2 bg-green-500 text-white rounded-lg shadow hover:bg-green-600 transition disabled:opacity-50">Insert Row</button>
+                            <button (click)="replicateRow()" [disabled]="!dataRows().length || !selectedRowId()" class="px-4 py-2 bg-yellow-500 text-white rounded-lg shadow hover:bg-yellow-600 transition disabled:opacity-50">Replicate Selected</button>
+                            <button (click)="deleteRow()" [disabled]="!selectedRowId()" class="px-4 py-2 bg-red-500 text-white rounded-lg shadow hover:bg-red-600 transition disabled:opacity-50">Delete Selected</button>
+
+                            <div *ngIf="dataRows().length" class="ml-auto flex items-center space-x-2">
+                                <span class="font-semibold text-gray-700">Sort:</span>
+                                <button (click)="clearSort()" class="px-3 py-1 text-sm bg-gray-200 rounded-lg hover:bg-gray-300 transition">Clear Sort</button>
+                            </div>
+                        </div>
+
+                        <!-- Column Visibility and Key Configuration -->
+                        <div *ngIf="dataRows().length" class="p-4 bg-gray-50 rounded-lg shadow-sm">
+                            <h3 class="text-md font-semibold text-gray-700 mb-2">Column Configuration</h3>
+                            <div class="flex flex-wrap gap-4">
+                                <div *ngFor="let col of columnConfig()" class="flex items-center space-x-1 text-sm">
+                                    <input type="checkbox" 
+                                        [name]="'visible_' + col.name" 
+                                        [checked]="col.isVisible" 
+                                        (change)="toggleColumnVisibility(col.name, $event)" 
+                                        [disabled]="col.isUniqueKey" 
+                                        class="text-indigo-600 rounded">
+                                    <span class="text-gray-700">{{ col.name }}</span>
+                                    
+                                    <input type="checkbox" 
+                                        [name]="'unique_' + col.name" 
+                                        [checked]="col.isUniqueKey" 
+                                        (change)="toggleUniqueKey(col.name, $event)" 
+                                        class="ml-2 text-red-600 rounded">
+                                    <span class="text-red-600 text-xs font-medium">Key</span>
+                                </div>
+                            </div>
+                            <p class="text-xs text-gray-500 mt-2">Unique Key columns must remain visible.</p>
+                        </div>
+                        
+                        <!-- Data Grid -->
+                        <div class="data-grid-container shadow-xl rounded-xl border border-gray-200">
+                            <table *ngIf="dataRows().length" class="data-grid bg-white">
+                                <thead>
+                                    <tr cdkDropList cdkDropListOrientation="horizontal" (cdkDropListDropped)="dropColumn($event)">
+                                        <th class="w-12 sticky left-0 z-10 bg-gray-700 text-white">#</th>
+                                        <th *ngFor="let col of columnConfig()" 
+                                            [ngStyle]="{'display': col.isVisible ? 'table-cell' : 'none'}" 
+                                            (click)="sortData(col.name)"
+                                            cdkDrag 
+                                            [cdkDragData]="col.name">
+                                            <div class="flex items-center justify-between">
+                                                <span>{{ col.name }}</span>
+                                                <div class="ml-2">
+                                                    <ng-container *ngIf="col.isSortAsc !== null">
+                                                        <span class="text-xs text-yellow-300 mr-1">({{ col.sortOrder + 1 }})</span>
+                                                        <svg *ngIf="col.isSortAsc" class="w-4 h-4 inline-block" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 15l7-7 7 7"></path></svg>
+                                                        <svg *ngIf="!col.isSortAsc" class="w-4 h-4 inline-block" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                                                    </ng-container>
+                                                </div>
+                                            </div>
+                                        </th>
+                                        <th class="w-12 sticky right-0 z-10 bg-gray-700 text-white">Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody cdkDropList (cdkDropListDropped)="dropRow($event)">
+                                    <tr *ngFor="let row of sortedDataRows()" 
+                                        [class]="{'bg-indigo-50 border-indigo-400 shadow-inner': selectedRowId() === row.id}"
+                                        (click)="selectRow(row.id)"
+                                        (dblclick)="openDetailModal(row)"
+                                        cdkDrag>
+                                        <td class="w-12 sticky left-0 bg-white text-gray-500 text-sm drag-handle">
+                                            <svg class="w-4 h-4 inline-block" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"></path></svg>
+                                        </td>
+                                        <td *ngFor="let col of columnConfig()" 
+                                            [ngStyle]="{'display': col.isVisible ? 'table-cell' : 'none'}"
+                                            [cdkDragDisabled]="true"
+                                            [class]="{'editable-cell': true, 'font-semibold text-red-600': col.isUniqueKey}">
+                                            <input 
+                                                type="text" 
+                                                [ngModel]="row[col.name]" 
+                                                (ngModelChange)="updateCellValue(row.id, col.name, $event)"
+                                                [name]="'cell_' + row.id + '_' + col.name"
+                                            >
+                                        </td>
+                                        <td class="w-12 sticky right-0 z-10 bg-white text-center">
+                                            <button (click)="deleteRow(row.id)" class="text-red-500 hover:text-red-700 transition">
+                                                <svg class="w-5 h-5 inline-block" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+                                            </button>
+                                        </td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                            <div *ngIf="!dataRows().length" class="p-8 text-center text-gray-500 bg-white">
+                                Import a JSON file or use the REST API import option to begin managing configuration data.
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- IF/THEN Engine Tab -->
+                    <div *ngIf="mainTab() === 'engine'" class="space-y-6">
+                        <h2 class="text-3xl font-bold text-indigo-800">Rule-Based Data Transformation Engine</h2>
+                        
+                        <div class="flex flex-wrap items-center space-x-4">
+                            <button (click)="addRule()" class="px-6 py-3 bg-indigo-600 text-white rounded-lg shadow hover:bg-indigo-700 transition disabled:opacity-50">Add New Rule</button>
+                            <button (click)="applyAllRules()" [disabled]="!transformationRules().length" class="px-6 py-3 bg-green-600 text-white rounded-lg shadow-lg hover:bg-green-700 transition disabled:opacity-50">APPLY ALL RULES</button>
+                            <button (click)="saveRulesToFile()" [disabled]="!transformationRules().length" class="px-6 py-3 bg-gray-600 text-white rounded-lg shadow hover:bg-gray-700 transition disabled:opacity-50">Save Rule Set (.json)</button>
+                            <button (click)="loadRulesFromFile()" class="px-6 py-3 bg-gray-600 text-white rounded-lg shadow hover:bg-gray-700 transition">Load Rule Set (.json)</button>
+                        </div>
+                        
+                        <div class="space-y-8">
+                            <div *ngFor="let rule of transformationRules(); let ruleIndex = index" class="border-2 border-indigo-300 rounded-xl p-6 bg-white shadow-lg space-y-4">
+                                <div class="flex justify-between items-center border-b pb-3 mb-3">
+                                    <h3 class="text-xl font-bold text-indigo-700">Rule {{ ruleIndex + 1 }}: {{ rule.name }}</h3>
+                                    <div class="flex space-x-2">
+                                        <button (click)="removeRule(ruleIndex)" class="text-red-500 hover:text-red-700 transition">
+                                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+                                        </button>
+                                    </div>
+                                </div>
+
+                                <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                                    
+                                    <!-- IF Section (Conditions) -->
+                                    <div class="p-4 border border-gray-300 rounded-lg bg-gray-50">
+                                        <h4 class="font-bold text-gray-700 mb-3">IF Conditions (Target: {{ rule.name }})</h4>
+                                        <div *ngFor="let condition of rule.conditions; let condIndex = index" class="flex flex-wrap items-center space-x-2 mb-3 p-2 border-l-4" [ngClass]="{'border-indigo-500': condIndex === 0, 'border-yellow-500': condIndex > 0}">
+                                            
+                                            <!-- Logic Operator (AND/OR) -->
+                                            <div *ngIf="condIndex > 0" class="w-12">
+                                                <select 
+                                                    [ngModel]="condition.logic" 
+                                                    (ngModelChange)="updateRuleCondition(ruleIndex, condIndex, 'logic', $event)" 
+                                                    class="p-2 border rounded-lg text-sm bg-yellow-100 font-semibold text-yellow-800">
+                                                    <option value="AND">AND</option>
+                                                    <option value="OR">OR</option>
+                                                </select>
+                                            </div>
+                                            
+                                            <!-- Column Selector -->
+                                            <select 
+                                                [ngModel]="condition.column" 
+                                                (ngModelChange)="updateRuleCondition(ruleIndex, condIndex, 'column', $event)" 
+                                                class="p-2 border rounded-lg text-sm w-32">
+                                                <option value="" disabled>Select Column</option>
+                                                <option *ngFor="let col of columnConfig()" [value]="col.name">{{ col.name }}</option>
+                                            </select>
+
+                                            <!-- Operator Selector -->
+                                            <select 
+                                                [ngModel]="condition.operator" 
+                                                (ngModelChange)="updateRuleCondition(ruleIndex, condIndex, 'operator', $event)" 
+                                                class="p-2 border rounded-lg text-sm w-24">
+                                                <option *ngFor="let op of ruleOperators" [value]="op.value">{{ op.label }}</option>
+                                            </select>
+
+                                            <!-- Value Input -->
+                                            <input 
+                                                type="text" 
+                                                [ngModel]="condition.value" 
+                                                (ngModelChange)="updateRuleCondition(ruleIndex, condIndex, 'value', $event)"
+                                                placeholder="Value (* for wildcard)" 
+                                                class="p-2 border rounded-lg text-sm flex-grow min-w-[100px]">
+
+                                            <!-- Remove Condition -->
+                                            <button (click)="removeRuleCondition(ruleIndex, condIndex)" class="text-red-500 hover:text-red-700 ml-2">
+                                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                                            </button>
+                                        </div>
+                                        <button (click)="addRuleCondition(ruleIndex)" class="mt-2 px-4 py-1 text-sm bg-indigo-500 text-white rounded-lg hover:bg-indigo-600 transition">Add Condition</button>
+                                    </div>
+                                    
+                                    <!-- THEN Section (Actions) -->
+                                    <div class="p-4 border border-gray-300 rounded-lg bg-gray-50">
+                                        <h4 class="font-bold text-gray-700 mb-3">THEN Set Value(s)</h4>
+                                        <div *ngFor="let action of rule.actions; let actIndex = index" class="flex items-center space-x-2 mb-3 p-2 border-l-4 border-green-500">
+                                            
+                                            <!-- Target Column Selector -->
+                                            <select 
+                                                [ngModel]="action.targetColumn" 
+                                                (ngModelChange)="updateRuleAction(ruleIndex, actIndex, 'targetColumn', $event)" 
+                                                class="p-2 border rounded-lg text-sm w-32">
+                                                <option value="" disabled>Set Column</option>
+                                                <option *ngFor="let col of columnConfig()" [value]="col.name">{{ col.name }}</option>
+                                            </select>
+
+                                            <span class="font-bold text-gray-600">to</span>
+
+                                            <!-- Value/Formula Input -->
+                                            <input 
+                                                type="text" 
+                                                [ngModel]="action.value" 
+                                                (ngModelChange)="updateRuleAction(ruleIndex, actIndex, 'value', $event)"
+                                                placeholder="Value or Formula (+,-,*,/)" 
+                                                class="p-2 border rounded-lg text-sm flex-grow min-w-[120px]">
+                                            
+                                            <!-- Remove Action -->
+                                            <button (click)="removeRuleAction(ruleIndex, actIndex)" class="text-red-500 hover:text-red-700 ml-2">
+                                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                                            </button>
+                                        </div>
+                                        <button (click)="addRuleAction(ruleIndex)" class="mt-2 px-4 py-1 text-sm bg-green-500 text-white rounded-lg hover:bg-green-600 transition">Add Set Action</button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- API Cross-Reference Tab -->
+                    <div *ngIf="mainTab() === 'api-config'" class="space-y-6">
+                        <h2 class="text-3xl font-bold text-indigo-800">Column to REST API Cross-Reference</h2>
+                        <p class="text-gray-600">Define APIs for Single Row Lookup (Row Viewer) and Bulk API calls (Data Grid actions).</p>
+
+                        <div class="flex space-x-4">
+                            <button (click)="addApiConfig()" class="px-6 py-3 bg-indigo-600 text-white rounded-lg shadow hover:bg-indigo-700 transition disabled:opacity-50">Add New API Mapping</button>
+                            <button (click)="runBulkApiCall()" [disabled]="!apiConfigList().length || !dataRows().length" class="px-6 py-3 bg-red-600 text-white rounded-lg shadow-lg hover:bg-red-700 transition disabled:opacity-50">Run Bulk API Call</button>
+                        </div>
+                        
+                        <div class="overflow-x-auto bg-white rounded-xl shadow-lg border border-gray-200">
+                            <table class="min-w-full text-left org-admin-grid">
+                                <thead>
+                                    <tr>
+                                        <th class="w-1/4">Column (Source Value)</th>
+                                        <th class="w-1/4">API Name (Lookup Endpoint)</th>
+                                        <th class="w-1/4">Map To Column (Data Grid Update)</th>
+                                        <th class="w-1/6">Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <tr *ngFor="let config of apiConfigList(); let i = index" class="border-t">
+                                        <td>
+                                            <select 
+                                                [ngModel]="config.columnName" 
+                                                (ngModelChange)="updateApiConfig(i, 'columnName', $event)" 
+                                                class="p-2 border rounded-lg text-sm w-full">
+                                                <option value="" disabled>Select Source Column</option>
+                                                <option *ngFor="let col of columnConfig()" [value]="col.name">{{ col.name }}</option>
+                                            </select>
+                                        </td>
+                                        <td>
+                                            <input type="text" [ngModel]="config.apiName" (ngModelChange)="updateApiConfig(i, 'apiName', $event)" placeholder="e.g., GetEmployeeDetails" class="p-2 border rounded-lg text-sm w-full">
+                                        </td>
+                                        <td>
+                                            <input type="text" [ngModel]="config.mapToColumn" (ngModelChange)="updateApiConfig(i, 'mapToColumn', $event)" placeholder="e.g., employeeName" class="p-2 border rounded-lg text-sm w-full">
+                                        </td>
+                                        <td class="text-center">
+                                            <button (click)="removeApiConfig(i)" class="text-red-500 hover:text-red-700 transition">
+                                                <svg class="w-5 h-5 inline-block" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+                                            </button>
+                                        </td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    `,
+    changeDetection: ChangeDetectionStrategy.OnPush,
+})
+export class App implements OnInit {
+    // --- DI and Core Setup ---
+    private readonly auth: Auth;
+    private readonly db: Firestore;
+    private ruleListener: Unsubscribe | null = null;
+    private testimonialListener: Unsubscribe | null = null;
+    private apiConfigListener: Unsubscribe | null = null;
+    
+    constructor() {
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        const app = initializeApp(firebaseConfig);
+        this.auth = getAuth(app);
+        this.db = getFirestore(app);
+    }
+
+    // --- Signals & State Management ---
+
+    // UI State
+    mainTab = signal<'my-profile' | 'data-grid' | 'engine' | 'api-config' | 'org-admin' | 'support'>('my-profile');
+    isLoading = signal<boolean>(false);
+    loadingMessage = signal<string>('Loading...');
+
+    // Authentication State
+    authState = signal<AuthState>({
+        isAuthenticated: false,
+        isAuthReady: false,
+        error: null,
+        currentView: 'landing',
+        name: '',
+        email: '',
+        password: '',
+        organizationName: '',
+        selectedLicenseType: 'Free',
+        licensesToPurchase: 1,
+        licenseEmails: [], // Stores only the newly entered emails during registration
+        isAdditionalPurchase: false,
+    });
+
+    // Profile State (The full, stored user profile)
+    currentProfile = signal<UserProfile>({
+        userId: 'anonymous',
+        accountId: 'N/A',
+        organizationName: 'N/A',
+        name: 'Guest',
+        email: 'guest@example.com',
+        isAdmin: false,
+        licenseType: 'Free',
+        licenseExpires: 0,
+        assignedLicenses: [],
+        apiBaseUrl: '',
+        apiAuthToken: '',
+        apiEnvironment: 'prod',
+    });
+
+    // Data Grid State
+    dataRows = signal<DataRow[]>([]);
+    columnConfig = signal<ColumnConfig[]>([]);
+    selectedRowId = signal<string | null>(null);
+
+    // Engine State
+    transformationRules = signal<TransformationRule[]>([]);
+    ruleOperators = [
+        { label: '=', value: 'eq' }, { label: '!=', value: 'neq' },
+        { label: '>', value: 'gt' }, { label: '<', value: 'lt' },
+        { label: 'includes', value: 'in' }, { label: 'excludes', value: 'nin' }
+    ];
+
+    // API Config State
+    apiConfigList = signal<ApiConfig[]>([]);
+    
+    // Testimonial State
+    pendingTestimonials = signal<Testimonial[]>([]);
+    approvedTestimonials = signal<Testimonial[]>([]);
+    userTestimonials = computed(() => this.pendingTestimonials().concat(this.approvedTestimonials()).filter(t => t.userId === this.currentProfile().userId));
+    newTestimonialContent = '';
+    submissionMessage = '';
+
+    // Modals
+    paymentModalOpen = signal<boolean>(false);
+    bulkApiModalOpen = signal<boolean>(false);
+    bulkApiResults = signal<{ rowId: string, inputValue: any, responseJson: string }[]>([]);
+    
+    detailModal = signal<DetailModalState>({
+        isOpen: false,
+        row: null,
+        tab: 'detail',
+        apiResponse: '',
+        apiConfig: null,
+    });
+
+    // --- Computed Properties ---
+
+    // Auth View Logic
+    isLandingView = computed(() => this.authState().currentView === 'landing');
+    isLoginView = computed(() => this.authState().currentView === 'login');
+    isRegisterView = computed(() => this.authState().currentView === 'register');
+    isAppView = computed(() => this.authState().currentView === 'app');
+
+    // License Logic
+    licenses = {
+        Free: { type: 'Free', price: 0.00, features: ['Sort'], canSort: true, canUseEngine: false, canUseApi: false },
+        Basic: { type: 'Basic', price: 299.99, features: ['Sort, Row Edit'], canSort: true, canUseEngine: false, canUseApi: false },
+        Professional: { type: 'Professional', price: 499.99, features: ['IF/THEN Engine'], canSort: true, canUseEngine: true, canUseApi: false },
+        Enterprise: { type: 'Enterprise', price: 999.99, features: ['All Features, REST API, SSO'], canSort: true, canUseEngine: true, canUseApi: true }
+    };
+    licenseTypes = computed(() => Object.keys(this.licenses));
+
+    selectedLicenseDetails = computed(() => this.licenses[this.authState().selectedLicenseType]);
+    
+    canSort = computed(() => this.currentProfile().licenseType !== 'Free' && this.currentProfile().licenseType !== 'Basic'); // Changed from license definition to profile
+    canUseEngine = computed(() => this.currentProfile().licenseType === 'Professional' || this.currentProfile().licenseType === 'Enterprise');
+    canUseApi = computed(() => this.currentProfile().licenseType === 'Enterprise');
+
+    licensesToPurchaseArray = computed(() => {
+        const count = this.authState().licensesToPurchase;
+        const startSeat = this.authState().isAdditionalPurchase ? this.currentProfile().assignedLicenses.length + 1 : 1;
+        
+        // This ensures the array has N-1 entries for secondary licenses
+        const secondaryCount = Math.max(0, count - 1); 
+        
+        return Array(secondaryCount).fill(0).map((_, i) => ({
+            seatIndex: (this.authState().isAdditionalPurchase ? this.currentProfile().assignedLicenses.length + 1 : 2) + i,
+            isPrimary: false
+        }));
+    });
+
+    // Data Grid Logic
+    visibleColumns = computed(() => this.columnConfig().filter(col => col.isVisible));
+    uniqueKeyColumns = computed(() => this.columnConfig().filter(col => col.isUniqueKey));
+    
+    sortedDataRows = computed(() => {
+        const rows = [...this.dataRows()];
+        const sortColumns = [...this.columnConfig()].filter(col => col.isSortAsc !== null).sort((a, b) => a.sortOrder - b.sortOrder);
+
+        if (sortColumns.length === 0) return rows;
+
+        return rows.sort((a, b) => {
+            for (const col of sortColumns) {
+                const aVal = a[col.name];
+                const bVal = b[col.name];
+                const asc = col.isSortAsc;
+
+                if (aVal < bVal) return asc ? -1 : 1;
+                if (aVal > bVal) return asc ? 1 : -1;
+            }
+            return 0;
+        });
+    });
+
+    // --- Initialization ---
+
+    ngOnInit() {
+        this.updateLicensesToPurchase(this.authState().licensesToPurchase);
+        this.initializeApp();
+    }
+
+    private initializeApp() {
+        this.loadingMessage.set('Authenticating...');
+        this.isLoading.set(true);
+
+        onAuthStateChanged(this.auth, (user) => {
+            if (user && user.uid) {
+                this.loadUserProfile(user.uid);
+            } else {
+                // If there's no token, try anonymous sign-in first
+                if (typeof __initial_auth_token !== 'undefined' && this.authState().currentView !== 'app') {
+                    this.signInWithCustomToken(this.auth, __initial_auth_token);
+                } else {
+                    // Fallback to anonymous sign-in (allows reading public data)
+                    signInAnonymously(this.auth).then(() => {
+                        this.loadingMessage.set('Ready to market');
+                        this.authState.update(state => ({ ...state, isAuthReady: true }));
+                        this.listenToPublicData();
+                        if (this.authState().currentView !== 'app') {
+                            this.navigateTo('landing');
+                        }
+                    }).catch(error => {
+                        console.error("Anonymous sign-in failed:", error);
+                        this.loadingMessage.set('Authentication Failed.');
+                        this.authState.update(state => ({ ...state, isAuthReady: true }));
+                        this.navigateTo('landing');
+                    });
+                }
+            }
+            this.isLoading.set(false);
+        });
+    }
+    
+    private signInWithCustomToken(auth: Auth, token: string) {
+        signInWithCustomToken(auth, token).catch(error => {
+            console.error("Custom token sign-in failed:", error);
+            // If custom token fails, sign in anonymously as a fallback
+            signInAnonymously(auth);
+        });
+    }
+
+    // --- Firebase Persistence ---
+
+    private listenToPublicData() {
+        // Public Testimonials (Read by everyone, including anonymous users)
+        const testimonialsCollection = collection(this.db, 'artifacts', this.appId(), 'public', 'testimonials');
+        this.testimonialListener = onSnapshot(query(testimonialsCollection, where('isApproved', '==', true)), (snapshot) => {
+            const approved: Testimonial[] = [];
+            const pending: Testimonial[] = [];
+            snapshot.forEach(doc => {
+                const data = doc.data() as Testimonial;
+                data.id = doc.id;
+                if (data.isApproved) {
+                    approved.push(data);
+                } else {
+                    pending.push(data);
+                }
+            });
+            this.approvedTestimonials.set(approved);
+            this.pendingTestimonials.set(pending);
+        }, error => {
+            console.error("Error listening to testimonials:", error);
+        });
+    }
+
+    private listenToUserRules(userId: string) {
+        if (this.ruleListener) this.ruleListener();
+        if (this.apiConfigListener) this.apiConfigListener();
+
+        // 1. Transformation Rules (Private Data)
+        const rulesCollection = collection(this.db, 'artifacts', this.appId(), 'users', userId, 'rules');
+        this.ruleListener = onSnapshot(rulesCollection, (snapshot) => {
+            const rules: TransformationRule[] = [];
+            snapshot.forEach(doc => {
+                rules.push(doc.data() as TransformationRule);
+            });
+            this.transformationRules.set(rules);
+        }, error => {
+            console.error("Error listening to rules:", error);
+        });
+
+        // 2. API Configs (Private Data)
+        const apiConfigCollection = collection(this.db, 'artifacts', this.appId(), 'users', userId, 'api_configs');
+        this.apiConfigListener = onSnapshot(apiConfigCollection, (snapshot) => {
+            const configs: ApiConfig[] = [];
+            snapshot.forEach(doc => {
+                configs.push(doc.data() as ApiConfig);
+            });
+            this.apiConfigList.set(configs);
+        }, error => {
+            console.error("Error listening to API Configs:", error);
+        });
+    }
+
+    private async loadUserProfile(userId: string): Promise<void> {
+        this.loadingMessage.set('Loading user profile...');
+        this.isLoading.set(true);
+        const userDocRef = doc(this.db, 'artifacts', this.appId(), 'users', userId, 'profile', 'data');
+        
+        try {
+            const docSnap = await getDoc(userDocRef);
+            if (docSnap.exists()) {
+                const profile = docSnap.data() as UserProfile;
+                this.currentProfile.set(profile);
+                this.authState.update(state => ({ ...state, isAuthenticated: true, isAuthReady: true, currentView: 'app' }));
+                this.listenToUserRules(userId);
+            } else {
+                console.warn("User profile not found. Forcing re-registration.");
+                // If a user logs in but their profile is missing (e.g., failed registration), force them back to the start.
+                this.authState.update(state => ({ ...state, isAuthReady: true, isAuthenticated: false, currentView: 'landing', error: 'Profile incomplete. Please register again.' }));
+            }
+        } catch (error) {
+            console.error("Error loading profile:", error);
+            this.authState.update(state => ({ ...state, isAuthReady: true, isAuthenticated: false, currentView: 'landing', error: 'Failed to load profile data.' }));
+        } finally {
+            this.isLoading.set(false);
+        }
+    }
+
+    // Account ID generation helper
+    private appId(): string {
+        return typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+    }
+
+    // --- Navigation & Auth Methods ---
+
+    navigateTo(view: AuthState['currentView']): void {
+        this.authState.update(state => ({
+            ...state,
+            currentView: view,
+            error: null,
+            isAdditionalPurchase: view === 'register' ? state.isAdditionalPurchase : false, // Reset only if not navigating to register
+            licensesToPurchase: 1,
+        }));
+        if (view !== 'register' && view !== 'login') {
+             this.authState.update(s => ({...s, isAdditionalPurchase: false}));
+             this.updateLicensesToPurchase(1); // Reset purchase count
+        }
+    }
+    
+    // License Text Helper
+    getLicenseOptionText(key: License['type']): string {
+        const license = this.licenses[key];
+        const priceText = license.price === 0.00 ? 'FREE' : `$${license.price.toFixed(2)}/yr`;
+        const featureText = license.features[0];
+        return `${license.type} (${priceText}) - Key Feature: ${featureText}`;
+    }
+
+    // License Color Helper
+    licenseColor(type: License['type']): string {
+        switch (type) {
+            case 'Free': return 'text-gray-500';
+            case 'Basic': return 'text-yellow-600';
+            case 'Professional': return 'text-indigo-600';
+            case 'Enterprise': return 'text-red-600';
+            default: return 'text-gray-500';
+        }
+    }
+
+    // Auth Form Field Update Handler
+    updateAuthField(field: keyof AuthState, value: any): void {
+        this.authState.update(state => ({ ...state, [field]: value, error: null }));
+    }
+    
+    // License Selection Update Handler
+    updateLicenseDetails(licenseType: License['type']): void {
+        this.authState.update(state => ({ ...state, selectedLicenseType: licenseType, error: null }));
+    }
+
+    // License Quantity Update Handler
+    updateLicensesToPurchase(value: any): void {
+        const newCount = parseInt(value, 10);
+        if (isNaN(newCount) || newCount < 1) {
+            return;
+        }
+
+        const currentEmails = this.authState().licenseEmails;
+        
+        let targetCount: number;
+        let startLicenseType: License['type'];
+
+        if (this.authState().isAdditionalPurchase) {
+             this.authState.update(state => ({ ...state, licensesToPurchase: newCount }));
+             targetCount = newCount;
+             startLicenseType = this.licenses[this.currentProfile().licenseType].type;
+        } else {
+            // Initial registration: LicensesToPurchase is the total count.
+            this.authState.update(state => ({ ...state, licensesToPurchase: newCount }));
+            targetCount = Math.max(0, newCount - 1);
+            startLicenseType = this.authState().selectedLicenseType;
+        }
+
+        // Generate or resize the licenseEmails array for the secondary/new seats
+        const newEmails = Array(targetCount).fill(0).map((_, i) => {
+            const existing = currentEmails[i];
+            if (existing) {
+                return existing;
+            }
+            return { email: '', licenseType: startLicenseType };
+        });
+        
+        this.authState.update(s => ({ ...s, licenseEmails: newEmails }));
+    }
+
+    // Update individual license email/type
+    updateLicenseEmail(index: number, field: 'email' | 'licenseType', value: any): void {
+        this.authState.update(state => {
+            const newEmails = [...state.licenseEmails];
+            if (newEmails[index]) {
+                newEmails[index] = { ...newEmails[index], [field]: value };
+            }
+            return { ...state, licenseEmails: newEmails };
+        });
+    }
+
+    private validateEmail(email: string): boolean {
+        // Regex for basic email format (user@domain.tld)
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(email)) {
+            return false;
+        }
+
+        // Commercial domain block list
+        const blockedDomains = ['gmail.com', 'yahoo.com', 'msn.com', 'hotmail.com', 'outlook.com', 'aol.com'];
+        const domain = email.substring(email.lastIndexOf('@') + 1).toLowerCase();
+
+        return !blockedDomains.includes(domain);
+    }
+
+    handleAuthSubmit(form: any): void {
+        this.authState.update(state => ({ ...state, error: null }));
+        if (form.invalid) {
+            this.authState.update(state => ({ ...state, error: 'Please fill out all required fields.' }));
+            return;
+        }
+
+        const { currentView, email, name, password, organizationName, isAdditionalPurchase } = this.authState();
+
+        if (currentView === 'login') {
+            this.simulateLogin(email, password);
+        } else { // Register
+            if (!this.validateEmail(email) && !isAdditionalPurchase) { // Primary email only validated on initial reg
+                this.authState.update(state => ({ ...state, error: 'Please enter a valid business email address (e.g., user@company.com).' }));
+                return;
+            }
+            
+            // Validate all license emails
+            const allEmails = [email, ...this.authState().licenseEmails.map(l => l.email)].filter(e => e.trim() !== '');
+            for (const mail of allEmails) {
+                 if (!this.validateEmail(mail)) {
+                    this.authState.update(state => ({ ...state, error: `License email "${mail}" is not a valid business email.` }));
+                    return;
+                }
+            }
+            
+            // Collect all unique license emails
+            if (new Set(allEmails).size !== allEmails.length) {
+                this.authState.update(state => ({ ...state, error: 'All license email addresses must be unique.' }));
+                return;
+            }
+            
+            // Open payment modal
+            this.paymentModalOpen.set(true);
+        }
+    }
+
+    // Mock sign-in logic
+    private async simulateLogin(email: string, password: string): Promise<void> {
+        this.isLoading.set(true);
+        this.loadingMessage.set('Authenticating...');
+
+        // Mock Firebase Sign-in
+        try {
+            // Use the current environment auth (anonymous) to perform Firestore reads/writes
+            const user = this.auth.currentUser;
+            if (!user) {
+                 throw new Error("Authentication context lost.");
+            }
+            
+            await this.loadUserProfile(user.uid);
+            
+            // Check if profile exists and matches credentials (mock check)
+            if (this.currentProfile().email !== email || password === '') {
+                throw new Error("Invalid credentials or profile not found.");
+            }
+            
+            this.navigateTo('app');
+            this.mainTab.set('my-profile');
+            
+        } catch (error) {
+            console.error("Login Failed:", error);
+            this.authState.update(state => ({ ...state, error: 'Authentication failed. Please check credentials or register.' }));
+        } finally {
+            this.isLoading.set(false);
+        }
+    }
+    
+    // Mock purchase logic
+    async processPaymentAndRegister(): Promise<void> {
+        this.paymentModalOpen.set(false);
+        this.loadingMessage.set('Processing payment and assigning licenses...');
+        this.isLoading.set(true);
+        
+        // Simulate payment gateway delay and success
+        await new Promise(resolve => setTimeout(resolve, 1500));
+
+        try {
+            const user = this.auth.currentUser;
+            if (!user) {
+                throw new Error("Authentication required to complete purchase.");
+            }
+
+            const { name, email, password, organizationName, selectedLicenseType, licensesToPurchase, isAdditionalPurchase } = this.authState();
+            
+            const existingLicensesCount = this.currentProfile().assignedLicenses.length;
+            const newLicenses: LicenseAssignment[] = [];
+            
+            // Collect all license assignments (secondary licenses for initial, all new for additional)
+            const licenseEmails = this.authState().licenseEmails;
+            
+            // 1. If Initial Registration
+            if (!isAdditionalPurchase) {
+                const adminLicense: LicenseAssignment = {
+                    seatId: 1,
+                    email: email,
+                    licenseType: selectedLicenseType,
+                };
+                newLicenses.push(adminLicense);
+                
+                // Add secondary licenses (starting seat 2)
+                for (let i = 0; i < licenseEmails.length; i++) {
+                    newLicenses.push({
+                        seatId: i + 2,
+                        email: licenseEmails[i].email,
+                        licenseType: licenseEmails[i].licenseType,
+                    });
+                }
+                
+                const newProfile: UserProfile = {
+                    userId: user.uid,
+                    accountId: `79-${crypto.randomUUID().slice(0, 8).toUpperCase()}`, // Mock starting at 79
+                    organizationName: organizationName,
+                    name: name,
+                    email: email,
+                    isAdmin: true,
+                    licenseType: selectedLicenseType,
+                    licenseExpires: Date.now() + (365 * 24 * 60 * 60 * 1000), // 365 days
+                    assignedLicenses: newLicenses,
+                    apiBaseUrl: '',
+                    apiAuthToken: '',
+                    apiEnvironment: 'prod',
+                };
+                
+                // Save profile
+                await setDoc(doc(this.db, 'artifacts', this.appId(), 'users', user.uid, 'profile', 'data'), newProfile);
+                this.currentProfile.set(newProfile);
+
+            } else {
+                // 2. If Additional Purchase
+                
+                let nextSeatId = existingLicensesCount + 1;
+                
+                for (const assignment of licenseEmails) {
+                     newLicenses.push({
+                        seatId: nextSeatId++,
+                        email: assignment.email,
+                        licenseType: assignment.licenseType,
+                    });
+                }
+                
+                // Update existing profile with new licenses
+                const updatedLicenses = [...this.currentProfile().assignedLicenses, ...newLicenses];
+                
+                // Determine the highest license type based on all assigned licenses
+                const allLicenseTypes = updatedLicenses.map(l => l.licenseType);
+                let highestLicense = 'Free';
+                if (allLicenseTypes.includes('Enterprise')) highestLicense = 'Enterprise';
+                else if (allLicenseTypes.includes('Professional')) highestLicense = 'Professional';
+                else if (allLicenseTypes.includes('Basic')) highestLicense = 'Basic';
+                
+                await setDoc(doc(this.db, 'artifacts', this.appId(), 'users', user.uid, 'profile', 'data'), {
+                    assignedLicenses: updatedLicenses,
+                    licenseType: highestLicense,
+                    licenseExpires: this.currentProfile().licenseExpires, // Keep original expiration for simplicity
+                }, { merge: true });
+                
+                // Force profile reload
+                await this.loadUserProfile(user.uid);
+            }
+            
+            this.loadingMessage.set('Access granted!');
+            
+            // IMPORTANT: Use setTimeout to ensure the DOM has finished painting the loading state and is ready for navigation
+            setTimeout(() => {
+                this.authState.update(state => ({ ...state, isAuthenticated: true, currentView: 'app', isAdditionalPurchase: false }));
+                this.mainTab.set('org-admin'); // Show license management post-purchase
+            }, 100); 
+
+        } catch (error) {
+            console.error("Purchase/Registration Failed:", error);
+            this.authState.update(state => ({ ...state, error: `Purchase failed: ${error.message}` }));
+        } finally {
+            this.isLoading.set(false);
+        }
+    }
+
+    // Logout function
+    async logout(): Promise<void> {
+        this.isLoading.set(true);
+        this.loadingMessage.set('Signing out...');
+        
+        // 1. Reset local state immediately to break the render cycle
+        this.authState.update(state => ({ 
+            ...state, 
+            isAuthenticated: false, 
+            isAuthReady: false, 
+            currentView: 'landing', 
+            name: '', 
+            email: '', 
+            password: '', 
+            error: null 
+        }));
+        this.currentProfile.set({
+            userId: 'anonymous',
+            accountId: 'N/A',
+            organizationName: 'N/A',
+            name: 'Guest',
+            email: 'guest@example.com',
+            isAdmin: false,
+            licenseType: 'Free',
+            licenseExpires: 0,
+            assignedLicenses: [],
+            apiBaseUrl: '',
+            apiAuthToken: '',
+            apiEnvironment: 'prod',
+        });
+        
+        // 2. Tear down listeners
+        if (this.ruleListener) this.ruleListener();
+        if (this.testimonialListener) this.testimonialListener();
+        if (this.apiConfigListener) this.apiConfigListener();
+
+        // 3. Perform asynchronous sign out
+        try {
+            await signOut(this.auth);
+        } catch (error) {
+            console.error("Error during Firebase sign out:", error);
+        } finally {
+            // 4. Force navigation to landing and stop loading animation
+            this.isLoading.set(false);
+            this.navigateTo('landing');
+            this.initializeApp(); // Reinitialize for anonymous access (needed for public data)
+        }
+    }
+
+    // --- Data Grid Methods ---
+    
+    importJsonFile(): void {
+        this.loadingMessage.set('Parsing JSON file...');
+        this.isLoading.set(true);
+
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = 'application/json';
+        input.onchange = async (e) => {
+            const file = (e.target as HTMLInputElement).files?.[0];
+            if (!file) {
+                this.isLoading.set(false);
+                return;
+            }
+
+            try {
+                const text = await file.text();
+                const json: DataRow[] = JSON.parse(text);
+
+                if (!Array.isArray(json) || json.length === 0) {
+                    throw new Error("File must contain an array of objects.");
+                }
+
+                // 1. Generate Column Config
+                const sampleRow = json[0];
+                const newColumns: ColumnConfig[] = Object.keys(sampleRow).map((key, index) => ({
+                    name: key,
+                    isVisible: true,
+                    isUniqueKey: index === 0, // Default first column as key
+                    isSortAsc: null,
+                    sortOrder: 0,
+                }));
+                this.columnConfig.set(newColumns);
+
+                // 2. Assign unique IDs to rows (essential for data manipulation)
+                const rowsWithIds = json.map(row => ({
+                    ...row,
+                    id: row.id || crypto.randomUUID(),
+                }));
+
+                this.dataRows.set(rowsWithIds);
+                this.selectedRowId.set(null);
+                this.loadingMessage.set(`Successfully imported ${rowsWithIds.length} rows.`);
+
+            } catch (error) {
+                console.error("Import failed:", error);
+                this.loadingMessage.set(`Import failed: ${error.message}`);
+            } finally {
+                this.isLoading.set(false);
+            }
+        };
+        input.click();
+    }
+
+    exportJsonFile(): void {
+        const exportedRows = this.dataRows().map(row => {
+            // Exclude the internal 'id' property
+            const { id, ...rest } = row;
+            return rest;
+        });
+
+        const jsonString = JSON.stringify(exportedRows, null, 2);
+        const blob = new Blob([jsonString], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'wabbat_export_' + new Date().toISOString().slice(0, 10) + '.json';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+    }
+    
+    importDataFromApi(): void {
+        if (!this.canUseApi()) return;
+        alert("Mock: Importing data from REST API using configured Base URL and Authentication Token with v2 and pagination settings.");
+    }
+    
+    exportDataToApi(): void {
+        if (!this.canUseApi()) return;
+        alert("Mock: Exporting data to REST API using configured Base URL and Authentication Token with v2 and pagination settings.");
+    }
+    
+    // Data Manipulation
+    selectRow(rowId: string): void {
+        this.selectedRowId.set(rowId);
+    }
+
+    addRow(sourceRow: DataRow | null): void {
+        const newRow: DataRow = { id: crypto.randomUUID() };
+        
+        this.columnConfig().forEach(col => {
+            newRow[col.name] = sourceRow ? sourceRow[col.name] : '';
+        });
+        
+        // Ensure unique keys are generated if replicated
+        if (sourceRow && this.uniqueKeyColumns().length > 0) {
+            this.uniqueKeyColumns().forEach(col => {
+                newRow[col.name] = 'COPY_' + sourceRow[col.name] + '_' + Date.now().toString().slice(-4);
+            });
+        }
+
+        this.dataRows.update(rows => [newRow, ...rows]);
+        this.selectedRowId.set(newRow.id);
+    }
+
+    replicateRow(): void {
+        const selectedId = this.selectedRowId();
+        const sourceRow = this.dataRows().find(r => r.id === selectedId);
+        if (sourceRow) {
+            this.addRow(sourceRow);
+        }
+    }
+
+    deleteRow(rowId?: string): void {
+        const idToDelete = rowId || this.selectedRowId();
+        if (!idToDelete) return;
+        
+        this.dataRows.update(rows => rows.filter(row => row.id !== idToDelete));
+        if (this.selectedRowId() === idToDelete) {
+            this.selectedRowId.set(null);
+        }
+    }
+    
+    updateCellValue(rowId: string, colName: string, newValue: any): void {
+        this.dataRows.update(rows => rows.map(row => {
+            if (row.id === rowId) {
+                const uniqueKeyCols = this.uniqueKeyColumns();
+                if (uniqueKeyCols.some(col => col.name === colName)) {
+                    // Unique Key Validation
+                    const isDuplicate = rows.some(r => r.id !== rowId && r[colName] === newValue);
+                    if (isDuplicate) {
+                        console.error(`ERROR: Value '${newValue}' for unique key column '${colName}' already exists.`);
+                        return row; // Prevent update if duplicate
+                    }
+                }
+                return { ...row, [colName]: newValue };
+            }
+            return row;
+        }));
+    }
+
+    // Sorting
+    sortData(columnName: string): void {
+        if (!this.canSort()) {
+            console.error('License does not permit advanced sorting.');
+            return;
+        }
+        
+        this.columnConfig.update(columns => {
+            const column = columns.find(c => c.name === columnName);
+            if (!column) return columns;
+
+            const currentSortOrder = columns.filter(c => c.isSortAsc !== null).sort((a, b) => a.sortOrder - b.sortOrder).map(c => c.name);
+            const currentOrderIndex = currentSortOrder.indexOf(columnName);
+
+            if (column.isSortAsc === null) {
+                // New sort: Primary Ascending
+                column.isSortAsc = true;
+                column.sortOrder = currentSortOrder.length;
+            } else if (column.isSortAsc === true) {
+                // Change to Descending
+                column.isSortAsc = false;
+            } else {
+                // Clear sort
+                column.isSortAsc = null;
+                column.sortOrder = -1;
+                // Renumber existing sorts to close the gap
+                columns.filter(c => c.isSortAsc !== null).forEach(c => {
+                    if (c.sortOrder > currentOrderIndex) {
+                        c.sortOrder -= 1;
+                    }
+                });
+            }
+            return [...columns];
+        });
+    }
+
+    clearSort(): void {
+        this.columnConfig.update(columns => columns.map(col => ({ ...col, isSortAsc: null, sortOrder: -1 })));
+    }
+
+    // Column Configuration
+    toggleColumnVisibility(columnName: string, event: Event): void {
+        const isChecked = (event.target as HTMLInputElement).checked;
+        this.columnConfig.update(columns => columns.map(col => 
+            col.name === columnName ? { ...col, isVisible: isChecked } : col
+        ));
+    }
+    
+    toggleUniqueKey(columnName: string, event: Event): void {
+        const isChecked = (event.target as HTMLInputElement).checked;
+        
+        this.columnConfig.update(columns => columns.map(col => {
+            if (col.name === columnName) {
+                const updatedCol = { ...col, isUniqueKey: isChecked };
+                // If set as key, force visibility
+                if (isChecked) {
+                    updatedCol.isVisible = true;
+                }
+                return updatedCol;
+            }
+            return col;
+        }));
+    }
+
+    // Drag and Drop (Columns)
+    dropColumn(event: CdkDragDrop<string[]>) {
+        this.columnConfig.update(columns => {
+            const currentVisible = columns.filter(col => col.isVisible);
+            const hidden = columns.filter(col => !col.isVisible);
+            
+            moveItemInArray(currentVisible, event.previousIndex, event.currentIndex);
+
+            // Reconstruct the array: visible + hidden
+            const newColumns = [...currentVisible, ...hidden];
+            return newColumns;
+        });
+    }
+
+    // Drag and Drop (Rows)
+    dropRow(event: CdkDragDrop<DataRow[]>) {
+        this.dataRows.update(rows => {
+            moveItemInArray(rows, event.previousIndex, event.currentIndex);
+            return [...rows];
+        });
+    }
+
+    // --- Transformation Engine Methods ---
+
+    addRule(): void {
+        if (!this.canUseEngine()) return;
+        this.transformationRules.update(rules => [...rules, {
+            id: crypto.randomUUID(),
+            name: `Rule ${rules.length + 1}`,
+            conditions: [{ column: this.columnConfig()[0]?.name || '', operator: 'eq', value: '', logic: 'AND' }],
+            actions: [{ targetColumn: this.columnConfig()[0]?.name || '', value: '' }]
+        }]);
+    }
+
+    removeRule(index: number): void {
+        this.transformationRules.update(rules => rules.filter((_, i) => i !== index));
+    }
+
+    addRuleCondition(ruleIndex: number): void {
+        this.transformationRules.update(rules => {
+            const newRules = [...rules];
+            newRules[ruleIndex].conditions.push({ column: newRules[ruleIndex].conditions[0]?.column || '', operator: 'eq', value: '', logic: 'AND' });
+            return newRules;
+        });
+    }
+
+    removeRuleCondition(ruleIndex: number, condIndex: number): void {
+        this.transformationRules.update(rules => {
+            const newRules = [...rules];
+            newRules[ruleIndex].conditions = newRules[ruleIndex].conditions.filter((_, i) => i !== condIndex);
+            // Ensure first condition remains AND for display purposes, but it's ignored in logic
+            if (newRules[ruleIndex].conditions.length > 0) {
+                 newRules[ruleIndex].conditions[0].logic = 'AND';
+            }
+            return newRules;
+        });
+    }
+
+    updateRuleCondition(ruleIndex: number, condIndex: number, field: keyof RuleCondition, value: any): void {
+        this.transformationRules.update(rules => {
+            const newRules = [...rules];
+            newRules[ruleIndex].conditions[condIndex] = { ...newRules[ruleIndex].conditions[condIndex], [field]: value };
+            return newRules;
+        });
+    }
+
+    addRuleAction(ruleIndex: number): void {
+        this.transformationRules.update(rules => {
+            const newRules = [...rules];
+            newRules[ruleIndex].actions.push({ targetColumn: newRules[ruleIndex].actions[0]?.targetColumn || '', value: '' });
+            return newRules;
+        });
+    }
+
+    removeRuleAction(ruleIndex: number, actIndex: number): void {
+        this.transformationRules.update(rules => {
+            const newRules = [...rules];
+            newRules[ruleIndex].actions = newRules[ruleIndex].actions.filter((_, i) => i !== actIndex);
+            return newRules;
+        });
+    }
+    
+    updateRuleAction(ruleIndex: number, actIndex: number, field: keyof RuleAction, value: any): void {
+        if (field === 'targetColumn') {
+            const isDuplicate = this.checkDuplicateActionColumns(ruleIndex, value);
+            if (isDuplicate) {
+                console.error(`ERROR: Column '${value}' is already a target in this rule.`);
+                return;
+            }
+        }
+        
+        this.transformationRules.update(rules => {
+            const newRules = [...rules];
+            newRules[ruleIndex].actions[actIndex] = { ...newRules[ruleIndex].actions[actIndex], [field]: value };
+            return newRules;
+        });
+    }
+
+    private checkDuplicateActionColumns(ruleIndex: number, targetCol: string): boolean {
+        const rule = this.transformationRules()[ruleIndex];
+        return rule.actions.some(action => action.targetColumn === targetCol);
+    }
+    
+    // Rule Persistence
+    saveRulesToFile(): void {
+        const jsonString = JSON.stringify(this.transformationRules(), null, 2);
+        const blob = new Blob([jsonString], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'wabbat_rule_set_' + new Date().toISOString().slice(0, 10) + '.json';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        
+        // alert('Rule set saved successfully.'); // Removed alert to follow instruction
+    }
+    
+    loadRulesFromFile(): void {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = 'application/json';
+        input.onchange = async (e) => {
+            const file = (e.target as HTMLInputElement).files?.[0];
+            if (!file) return;
+
+            try {
+                const text = await file.text();
+                const json: TransformationRule[] = JSON.parse(text);
+
+                if (!Array.isArray(json) || json.length === 0 || !json[0].conditions || !json[0].actions) {
+                    throw new Error("Invalid Rule Set format.");
+                }
+
+                this.transformationRules.set(json);
+                // alert(`Successfully loaded ${json.length} rules.`); // Removed alert to follow instruction
+
+            } catch (error) {
+                console.error("Load rules failed:", error);
+                // alert(`Load rules failed: ${error.message}`); // Removed alert to follow instruction
+            }
+        };
+        input.click();
+    }
+
+    // Rule Application
+    applyAllRules(): void {
+        if (!this.canUseEngine()) return;
+        this.loadingMessage.set('Applying transformation rules...');
+        this.isLoading.set(true);
+
+        const rules = this.transformationRules();
+        let rows = [...this.dataRows()];
+
+        rows = rows.map(row => {
+            let newRow = { ...row };
+            for (const rule of rules) {
+                if (this.checkConditions(newRow, rule.conditions)) {
+                    newRow = this.applyActions(newRow, rule.actions);
+                }
+            }
+            return newRow;
+        });
+
+        this.dataRows.set(rows);
+        this.isLoading.set(false);
+        // alert('Transformation complete! Check Data Grid tab for results.'); // Removed alert to follow instruction
+    }
+    
+    private checkConditions(row: DataRow, conditions: RuleCondition[]): boolean {
+        if (conditions.length === 0) return true;
+
+        let overallResult = false;
+        let groupResult = true;
+        let lastLogic = 'AND';
+
+        for (let i = 0; i < conditions.length; i++) {
+            const cond = conditions[i];
+            const rowValue = row[cond.column];
+            const conditionMet = this.evaluateCondition(rowValue, cond.operator, cond.value);
+            const currentLogic = cond.logic || 'AND';
+
+            if (i === 0) {
+                overallResult = conditionMet;
+                groupResult = conditionMet;
+                lastLogic = currentLogic;
+                continue;
+            }
+
+            if (currentLogic === 'AND') {
+                groupResult = groupResult && conditionMet;
+            } else if (currentLogic === 'OR') {
+                if (lastLogic === 'AND') {
+                    // Start new OR group
+                    overallResult = overallResult || groupResult;
+                    groupResult = conditionMet;
+                } else {
+                    // Continue OR group
+                    groupResult = groupResult || conditionMet;
+                }
+            }
+            lastLogic = currentLogic;
+        }
+
+        return overallResult || groupResult; // Final check for the last group
+    }
+    
+    private evaluateCondition(rowValue: any, operator: string, value: string): boolean {
+        if (rowValue === undefined || rowValue === null) return false;
+        
+        const rowString = String(rowValue).toLowerCase();
+        const condString = value.toLowerCase();
+
+        switch (operator) {
+            case 'eq': return rowString === condString;
+            case 'neq': return rowString !== condString;
+            case 'gt': return parseFloat(rowString) > parseFloat(condString);
+            case 'lt': return parseFloat(rowString) < parseFloat(condString);
+            case 'in': 
+                if (condString.includes('*')) {
+                    // Wildcard 'includes' logic
+                    const regex = new RegExp('^' + condString.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\\\*/g, '.*') + '$', 'i');
+                    return regex.test(rowString);
+                }
+                return rowString.includes(condString);
+            case 'nin': return !rowString.includes(condString);
+            default: return false;
+        }
+    }
+    
+    private applyActions(row: DataRow, actions: RuleAction[]): DataRow {
+        let newRow = { ...row };
+        for (const action of actions) {
+            const targetCol = action.targetColumn;
+            const formula = action.value;
+
+            // Simple check for formula vs literal value
+            if (formula.match(/[\+\-\*\/]/) && this.columnConfig().some(col => formula.includes(col.name))) {
+                // Formula Logic (Simple Parser)
+                try {
+                    let calculatedValue: any = formula; // Default to string if calculation fails
+                    
+                    // Simple regex to find column names (variables) in the formula
+                    const columnNamesInFormula = formula.match(/{{\s*(\w+)\s*}}/g)?.map(match => match.replace(/\{\{\s*|\s*\}\}/g, ''));
+                    let expression = formula;
+
+                    // Substitute column names with their numeric values (default to 0 if non-numeric)
+                    if (columnNamesInFormula) {
+                        for (const colName of columnNamesInFormula) {
+                             const colValue = parseFloat(newRow[colName]) || 0;
+                             expression = expression.replace(new RegExp(`{{\\s*${colName}\\s*}}`, 'g'), colValue.toString());
+                        }
+                    }
+
+                    // Basic arithmetic simulation
+                    const match = expression.match(/(\d+\.?\d*)\s*([\+\-\*\/])\s*(\d+\.?\d*)/);
+                    if (match) {
+                        const num1 = parseFloat(match[1]);
+                        const operator = match[2];
+                        const num2 = parseFloat(match[3]);
+                        
+                        switch(operator) {
+                            case '+': calculatedValue = num1 + num2; break;
+                            case '-': calculatedValue = num1 - num2; break;
+                            case '*': calculatedValue = num1 * num2; break;
+                            case '/': calculatedValue = num1 / num2; break;
+                        }
+                    } else {
+                         calculatedValue = formula;
+                    }
+                    
+                    newRow[targetCol] = calculatedValue;
+
+                } catch (e) {
+                    console.error(`Rule action failed for column ${targetCol}:`, e);
+                    newRow[targetCol] = formula; // Fallback to literal string if calculation fails
+                }
+            } else {
+                // Literal Value
+                newRow[targetCol] = formula;
+            }
+        }
+        return newRow;
+    }
+
+
+    // --- API Configuration Methods ---
+    
+    addApiConfig(): void {
+        this.apiConfigList.update(configs => [...configs, {
+            id: crypto.randomUUID(),
+            columnName: this.columnConfig()[0]?.name || '',
+            apiName: '',
+            mapToColumn: '',
+        }]);
+    }
+
+    removeApiConfig(index: number): void {
+        this.apiConfigList.update(configs => configs.filter((_, i) => i !== index));
+        // TODO: Persist deletion to Firestore
+    }
+
+    updateApiConfig(index: number, field: keyof ApiConfig, value: any): void {
+        this.apiConfigList.update(configs => configs.map((config, i) =>
+            i === index ? { ...config, [field]: value } : config
+        ));
+        // TODO: Persist update to Firestore
+    }
+
+    // --- Row Detail Modal Methods ---
+
+    openDetailModal(row: DataRow): void {
+        this.detailModal.set({
+            isOpen: true,
+            row: row,
+            tab: 'detail',
+            apiResponse: '',
+            apiConfig: null,
+        });
+    }
+
+    closeDetailModal(): void {
+        this.detailModal.set({
+            isOpen: false,
+            row: null,
+            tab: 'detail',
+            apiResponse: '',
+            apiConfig: null,
+        });
+    }
+
+    setDetailModalTab(tab: 'detail' | 'api'): void {
+        this.detailModal.update(state => ({ ...state, tab }));
+    }
+
+    setApiLookupColumn(columnName: string): void {
+        const config = this.apiConfigList().find(c => c.columnName === columnName) || null;
+        this.detailModal.update(state => ({ ...state, apiConfig: config, apiResponse: '' }));
+    }
+
+    runSingleRowApiLookup(): void {
+        const modalState = this.detailModal();
+        const row = modalState.row;
+        const apiConfig = modalState.apiConfig;
+
+        if (!row || !apiConfig || !this.canUseApi()) return;
+
+        this.loadingMessage.set(`Running API lookup for column '${apiConfig.columnName}'...`);
+        this.isLoading.set(true);
+
+        const inputValue = row[apiConfig.columnName];
+        
+        // Mock API Call
+        setTimeout(() => {
+            const mockResponse = JSON.stringify({
+                status: 'success',
+                endpoint: `${this.currentProfile().apiBaseUrl}/${apiConfig.apiName}`,
+                queriedValue: inputValue,
+                mapField: apiConfig.mapToColumn,
+                data: {
+                    id: inputValue,
+                    employeeName: 'Mock Employee ' + row.id.slice(0, 4),
+                    title: 'Manager',
+                    isSupervisor: true,
+                    lookupTime: new Date().toISOString()
+                }
+            }, null, 2);
+
+            this.detailModal.update(state => ({ ...state, apiResponse: mockResponse }));
+            this.isLoading.set(false);
+
+        }, 1000);
+    }
+    
+    runBulkApiCall(): void {
+        const config = this.apiConfigList()[0]; // Use the first config for simplicity
+        if (!config || !this.canUseApi()) return;
+
+        this.loadingMessage.set(`Running bulk API lookup for column '${config.columnName}'...`);
+        this.isLoading.set(true);
+        this.bulkApiResults.set([]); // Clear previous results
+        this.bulkApiModalOpen.set(true);
+
+        const uniqueValues = Array.from(new Set(this.dataRows().map(row => row[config.columnName])));
+
+        let completedRequests = 0;
+        const totalRequests = Math.min(uniqueValues.length, 5); // Limit to 5 mock requests
+
+        for (let i = 0; i < totalRequests; i++) {
+            const value = uniqueValues[i];
+            const rowId = this.dataRows().find(r => r[config.columnName] === value)?.id || 'N/A';
+
+            // Mock API Call
+            setTimeout(() => {
+                const mockResponseData = {
+                    status: 'success',
+                    value: value,
+                    resolvedName: 'Batch Result ' + i,
+                    timestamp: Date.now()
+                };
+
+                const result = {
+                    rowId: rowId,
+                    inputValue: value,
+                    responseJson: JSON.stringify(mockResponseData, null, 2)
+                };
+                
+                this.bulkApiResults.update(results => [...results, result]);
+                completedRequests++;
+
+                if (completedRequests === totalRequests) {
+                    this.isLoading.set(false);
+                    this.loadingMessage.set('Bulk API call complete.');
+                }
+            }, 500 * (i + 1));
+        }
+        
+        if (totalRequests === 0) {
+            this.isLoading.set(false);
+            this.bulkApiModalOpen.set(false);
+        }
+    }
+
+
+    // --- Profile Persistence ---
+
+    async updateProfileField(field: keyof UserProfile, value: any): Promise<void> {
+        this.loadingMessage.set('Saving profile changes...');
+        this.isLoading.set(true);
+        
+        const userId = this.currentProfile().userId;
+        const userDocRef = doc(this.db, 'artifacts', this.appId(), 'users', userId, 'profile', 'data');
+        
+        try {
+            await setDoc(userDocRef, { [field]: value }, { merge: true });
+            this.currentProfile.update(profile => ({ ...profile, [field]: value }));
+            this.loadingMessage.set('Profile updated successfully.');
+        } catch (error) {
+            console.error("Error updating profile:", error);
+            this.loadingMessage.set('Failed to save profile changes.');
+        } finally {
+            this.isLoading.set(false);
+        }
+    }
+    
+    async saveProfileChanges(): Promise<void> {
+        this.loadingMessage.set('Saving all API config fields...');
+        this.isLoading.set(true);
+        
+        const userId = this.currentProfile().userId;
+        const userDocRef = doc(this.db, 'artifacts', this.appId(), 'users', userId, 'profile', 'data');
+        
+        try {
+            await setDoc(userDocRef, {
+                apiBaseUrl: this.currentProfile().apiBaseUrl,
+                apiAuthToken: this.currentProfile().apiAuthToken,
+                apiEnvironment: this.currentProfile().apiEnvironment,
+            }, { merge: true });
+            this.loadingMessage.set('API Configuration saved successfully.');
+        } catch (error) {
+            console.error("Error saving API Config:", error);
+            this.loadingMessage.set('Failed to save API Configuration.');
+        } finally {
+            this.isLoading.set(false);
+        }
+    }
+
+    // --- Testimonial Methods ---
+
+    async submitTestimonial(): Promise<void> {
+        if (!this.currentProfile().isAuthenticated || !this.newTestimonialContent.trim()) return;
+
+        this.isLoading.set(true);
+        this.loadingMessage.set('Submitting testimonial...');
+        
+        try {
+            const testimonial: Omit<Testimonial, 'id'> = {
+                userId: this.currentProfile().userId,
+                organizationName: this.currentProfile().organizationName,
+                content: this.newTestimonialContent.trim(),
+                isApproved: false, // Requires admin approval
+                timestamp: Date.now(),
+            };
+
+            await setDoc(doc(collection(this.db, 'artifacts', this.appId(), 'public', 'testimonials')), testimonial);
+            this.newTestimonialContent = '';
+            this.submissionMessage = 'Thank you! Your testimonial has been submitted and is pending admin review.';
+        } catch (error) {
+            console.error("Testimonial submission failed:", error);
+            this.submissionMessage = `Error submitting testimonial: ${error.message}`;
+        } finally {
+            this.isLoading.set(false);
+            setTimeout(() => this.submissionMessage = '', 5000);
+        }
+    }
+    
+    async approveTestimonial(id: string): Promise<void> {
+        if (!this.currentProfile().isAdmin) return;
+        this.isLoading.set(true);
+        this.loadingMessage.set('Approving testimonial...');
+        
+        try {
+            const docRef = doc(this.db, 'artifacts', this.appId(), 'public', 'testimonials', id);
+            await setDoc(docRef, { isApproved: true }, { merge: true });
+        } catch (error) {
+            console.error("Approval failed:", error);
+            // alert(`Approval failed: ${error.message}`); // Removed alert to follow instruction
+        } finally {
+            this.isLoading.set(false);
+        }
+    }
+    
+    async deleteTestimonial(id: string): Promise<void> {
+        if (!this.currentProfile().isAdmin) return;
+        this.isLoading.set(true);
+        this.loadingMessage.set('Deleting testimonial...');
+        
+        try {
+            const docRef = doc(this.db, 'artifacts', this.appId(), 'public', 'testimonials', id);
+            await deleteDoc(docRef);
+        } catch (error) {
+            console.error("Deletion failed:", error);
+            // alert(`Deletion failed: ${error.message}`); // Removed alert to follow instruction
+        } finally {
+            this.isLoading.set(false);
+        }
+    }
+
+    // --- Utility Methods ---
+    
+    tabClass(tabName: string): string {
+        const base = 'inline-block p-4 border-b-2 rounded-t-lg hover:text-indigo-600 hover:border-indigo-300 transition';
+        const active = this.mainTab() === tabName 
+            ? 'text-indigo-600 border-indigo-600 font-semibold' 
+            : 'border-transparent text-gray-500';
+        const disabled = this.isTabDisabled(tabName)
+            ? 'opacity-50 cursor-not-allowed'
+            : '';
+        return `${base} ${active} ${disabled}`;
+    }
+    
+    isTabDisabled(tabName: string): boolean {
+        switch (tabName) {
+            case 'engine': return !this.canUseEngine();
+            case 'api-config': return !this.canUseApi();
+            case 'org-admin': return !this.currentProfile().isAdmin;
+            default: return false;
+        }
+    }
+}
