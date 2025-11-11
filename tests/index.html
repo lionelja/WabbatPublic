@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Wabbat Transformation Rule Test</title>
+    <script src="https://cdn.jsdelivr.net/npm/zone.js/dist/zone.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@angular/core/bundles/core.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@angular/common/bundles/common.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@angular/forms/bundles/forms.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@angular/platform-browser/bundles/platform-browser.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@angular/platform-browser-dynamic/bundles/platform-browser-dynamic.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@angular/cdk/bundles/cdk.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/firebase/app/dist/index.cjs.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/firebase/auth/dist/index.cjs.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/firebase/firestore/dist/index.cjs.js"></script>
+    <script src="../index.html" type="module"></script>
+</head>
+<body>
+    <app-root></app-root>
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const app = document.querySelector('app-root').__ngSimpleHost__;
+
+            // Mock data for the test
+            const mockColumns = [
+                { name: 'id', isVisible: true, isUniqueKey: true, isSortAsc: null, sortOrder: 0 },
+                { name: 'status', isVisible: true, isUniqueKey: false, isSortAsc: null, sortOrder: 1 },
+                { name: 'value', isVisible: true, isUniqueKey: false, isSortAsc: null, sortOrder: 2 },
+            ];
+
+            app.columnConfig.set(mockColumns);
+
+            // Add a rule
+            app.addRule();
+
+            // Add an action
+            app.addRuleAction(0);
+
+            // Try to add another action
+            app.addRuleAction(0);
+
+            const rule = app.transformationRules()[0];
+            const actions = rule.actions;
+
+            if (actions.length === 2 && actions[0].targetColumn === actions[1].targetColumn) {
+                console.error('Test Failed: Duplicate action column added.');
+                document.body.innerHTML = '<h1>Test Failed: Duplicate action column added.</h1>';
+            } else {
+                console.log('Test Passed: Duplicate action column was not added.');
+                document.body.innerHTML = '<h1>Test Passed: Duplicate action column was not added.</h1>';
+            }
+        });
+    </script>
+</body>
+</html>

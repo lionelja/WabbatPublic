@@ -1940,7 +1940,18 @@ export class App implements OnInit {
     addRuleAction(ruleIndex: number): void {
         this.transformationRules.update(rules => {
             const newRules = [...rules];
-            newRules[ruleIndex].actions.push({ targetColumn: newRules[ruleIndex].actions[0]?.targetColumn || '', value: '' });
+            const rule = newRules[ruleIndex];
+            const existingActionColumns = new Set(rule.actions.map(a => a.targetColumn));
+            const availableColumns = this.columnConfig().map(c => c.name);
+
+            const nextAvailableColumn = availableColumns.find(colName => !existingActionColumns.has(colName));
+
+            if (nextAvailableColumn) {
+                rule.actions.push({ targetColumn: nextAvailableColumn, value: '' });
+            } else {
+                console.error("No available columns to add a new rule action.");
+                // Optionally, inform the user via a UI signal/message
+            }
             return newRules;
         });
     }
