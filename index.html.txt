@@ -1,15 +1,18 @@
-import { Component, OnInit, signal, computed, ChangeDetectionStrategy } from '@angular/core';
-import { CommonModule, CurrencyPipe } from '@angular/common';
-import { FormsModule } from '@angular/forms';
-import { DragDropModule, CdkDragDrop, moveItemInArray } from '@angular/cdk/drag-drop';
+import { Component, OnInit, signal, computed, ChangeDetectionStrategy, ViewChild, ElementRef, AfterViewInit } from '@angular/core';
+import { CommonModule, CurrencyPipe, TitleCasePipe } from '@angular/common';
+import { FormsModule, ReactiveFormsModule } from '@angular/forms';
+import { DragDropModule, CdkDragDrop, moveItemInArray, CdkDragMove } from '@angular/cdk/drag-drop';
+// SECURITY/AUTH CODE COMMENTED OUT FOR TESTING
+// FIREBASE IMPORTS MINIMALIZED/MOCKED
 import { initializeApp } from 'firebase/app';
-import { getAuth, signInAnonymously, signInWithCustomToken, signOut, onAuthStateChanged, Auth } from 'firebase/auth';
-import { getFirestore, collection, doc, setDoc, getDoc, onSnapshot, Firestore, query, where, DocumentData, arrayUnion, Unsubscribe, deleteDoc } from 'firebase/firestore';
+import { getAuth, Auth } from 'firebase/auth';
+// Removed unused Firestore imports since we are fully mocking persistence for all user and public data
+import { getFirestore, Firestore, DocumentData, Unsubscribe, collection, doc } from 'firebase/firestore'; 
 
 // --- Global Context Variables (Defined by Canvas Environment) ---
 declare const __app_id: string;
 declare const __firebase_config: string;
-declare const __initial_auth_token: string | undefined;
+// declare const __initial_auth_token: string | undefined; // Removed initial auth token
 
 // --- Interface Definitions ---
 
@@ -47,7 +50,7 @@ interface AuthState {
     isAuthenticated: boolean;
     isAuthReady: boolean;
     error: string | null;
-    currentView: 'landing' | 'register' | 'login' | 'app';
+    currentView: 'landing' | 'register' | 'login' | 'app' | 'contact' | 'relational-crts';
     name: string;
     email: string;
     password: string;
@@ -114,21 +117,67 @@ interface DetailModalState {
     apiConfig: ApiConfig | null; // Added apiConfig here
 }
 
+interface ErDiagramNode {
+    id: string;
+    type: 'rules' | 'source' | 'target';
+    name: string;
+    x: number;
+    y: number;
+    connections: { targetId: string, type: string }[];
+}
+
+interface RelationalFile {
+    name: string;
+    keys: string[];
+    data: DataRow[];
+    fileId: 'A' | 'B' | 'C'; // Added fileId for easier reference
+}
+
+interface RelationshipDefinition {
+    id: string;
+    mapName: string;
+    mapDescription: string;
+    
+    // Relationship A -> B (Primary Rule Set -> Reference File 1)
+    fileAColumn: string;
+    fileBColumn: string;
+    fileBRelation: '1:1' | '1:M' | 'M:M' | '0:1' | '0:M'; 
+
+    // Relationship B -> C (Reference File 1 -> Reference File 2)
+    fileCColumn: string;
+    fileCRelation: '1:1' | '1:M' | 'M:M' | '0:1' | '0:M'; 
+}
+
+interface ValidationResult {
+    status: 'IDLE' | 'OK' | 'ERROR';
+    errors: string[];
+}
+
+interface WhereUsedMapDetails {
+    mapName: string;
+    mapDescription: string;
+}
+
+
 // --- Component Definition ---
 
 @Component({
     selector: 'app-root',
     standalone: true,
-    imports: [CommonModule, FormsModule, DragDropModule, CurrencyPipe],
+    // FIX: Ensure FormsModule is listed first for proper template form directive resolution
+    imports: [CommonModule, FormsModule, ReactiveFormsModule, DragDropModule, CurrencyPipe, TitleCasePipe], 
     template: `
         <style>
+            /* GLOBAL STYLES - Modern, clean SaaS look */
             .app-container {
                 min-height: 100vh;
                 display: flex;
                 flex-direction: column;
-                background: linear-gradient(to right, #f8fafc, #e2e8f0); /* Light gradient background */
+                background: #f4f6fa; /* Light grey SaaS background */
                 font-family: 'Inter', sans-serif;
             }
+            
+            /* DATA GRID STYLING - High contrast, professional */
             .data-grid-container {
                 overflow-x: auto;
                 max-width: 100vw;
@@ -137,26 +186,37 @@ interface DetailModalState {
                 border-collapse: separate;
                 border-spacing: 0;
                 min-width: 100%;
-                table-layout: fixed;
+                /* Use auto layout for better cell fitting unless necessary */
+                table-layout: auto; 
+                border-radius: 8px;
+                overflow: hidden; /* Ensures borders/shadows are contained */
             }
             .data-grid th, .data-grid td {
                 padding: 12px 16px;
-                border: 1px solid #e2e8f0;
+                border: 1px solid #e0e7ff; /* Lighter border using indigo tint */
                 white-space: nowrap;
                 overflow: hidden;
                 text-overflow: ellipsis;
             }
             .data-grid th {
-                background-color: #3f3f46;
+                background-color: #312e81; /* Deep Indigo Header */
                 color: white;
+                font-weight: 600;
                 cursor: pointer;
                 user-select: none;
                 position: sticky;
                 top: 0;
                 z-index: 10;
+                transition: background-color 0.2s;
+            }
+            .data-grid th:hover {
+                background-color: #4338ca; /* Lighter Indigo on hover */
+            }
+            .data-grid tbody tr {
+                transition: background-color 0.2s, box-shadow 0.2s;
             }
             .data-grid tbody tr:hover {
-                background-color: #f1f5f9;
+                background-color: #eef2ff; /* Very light blue hover */
             }
             .editable-cell input {
                 width: 100%;
@@ -166,38 +226,49 @@ interface DetailModalState {
                 padding: 0;
                 margin: 0;
                 outline: none;
+                font-size: 14px;
             }
+            .selected-row {
+                background-color: #e0e7ff !important; /* Light Indigo for selected row */
+                box-shadow: 0 0 5px rgba(49, 46, 129, 0.2);
+            }
+            
+            /* MODAL STYLES - Clean and prominent */
             .modal-overlay {
                 position: fixed;
                 top: 0;
                 left: 0;
                 width: 100%;
                 height: 100%;
-                background-color: rgba(0, 0, 0, 0.6);
+                background-color: rgba(0, 0, 0, 0.7);
                 z-index: 50;
                 display: flex;
                 justify-content: center;
                 align-items: center;
-                backdrop-filter: blur(4px);
+                backdrop-filter: blur(8px); /* Sharper blur for modern feel */
             }
             .payment-modal-content, .detail-modal-content {
                 background-color: white;
-                border-radius: 12px;
-                box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.2), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
-                padding: 32px;
+                border-radius: 16px; /* Increased radius */
+                box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.4); /* Deeper shadow */
+                padding: 40px;
                 max-width: 90%;
                 max-height: 90vh;
                 overflow-y: auto;
                 z-index: 51;
             }
             .grid-tab-content {
-                height: calc(100vh - 120px); /* Adjust based on header height */
+                height: calc(100vh - 150px); 
                 overflow-y: auto;
-                padding: 16px;
+                padding: 16px 0; /* Adjusted padding */
             }
+            
+            /* ADMIN GRID STYLING */
             .org-admin-grid th {
                 background-color: #f1f5f9;
                 color: #1e293b;
+                font-weight: 700;
+                padding: 12px;
             }
             .testimonial-carousel {
                 display: flex;
@@ -210,9 +281,10 @@ interface DetailModalState {
                 flex: 0 0 90%;
                 scroll-snap-align: start;
                 background: white;
-                border-radius: 10px;
-                box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-                margin-right: 16px;
+                border-radius: 12px;
+                box-shadow: 0 4px 10px rgba(0, 0, 0, 0.1);
+                border-left: 5px solid #4f46e5; /* Accent color */
+                margin-right: 20px;
                 padding: 24px;
             }
             @media (min-width: 768px) {
@@ -220,7 +292,7 @@ interface DetailModalState {
                     flex: 0 0 30%;
                 }
             }
-            /* Custom CSS for Drag Handles */
+            /* DRAG HANDLES */
             .drag-handle {
                 cursor: grab;
                 color: #94a3b8;
@@ -228,24 +300,217 @@ interface DetailModalState {
                 text-align: center;
                 padding-right: 8px;
             }
-            .cdk-drag-placeholder {
-                opacity: 0;
-            }
-            .cdk-drag-animating {
-                transition: transform 250ms cubic-bezier(0, 0, 0.2, 1);
-            }
-            .cdk-drag-preview {
-                box-sizing: border-box;
-                border-radius: 4px;
-                box-shadow: 0 5px 5px -3px rgba(0, 0, 0, 0.2),
-                            0 8px 10px 1px rgba(0, 0, 0, 0.14),
-                            0 3px 14px 2px rgba(0, 0, 0, 0.12);
-                background: #f1f5f9;
-                padding: 12px 16px;
+            /* Flow Diagram Styles */
+            .flow-box {
+                background-color: white;
+                border-radius: 16px;
+                box-shadow: 0 4px 10px rgba(0, 0, 0, 0.1);
+                padding: 1rem;
+                text-align: center;
+                font-weight: 600;
+                min-height: 100px;
                 display: flex;
-                justify-content: flex-start;
                 align-items: center;
-                color: #1e293b;
+                justify-content: center;
+                border: 2px solid #4f46e5;
+                font-size: 0.9rem;
+            }
+            
+            /* Flow Diagram Styles */
+            .flow-wrapper {
+                position: relative;
+                display: grid;
+                grid-template-columns: 1fr 40px 1fr 40px 1fr 40px 1fr;
+                grid-template-rows: 1fr 30px 1fr; /* Top step, middle row, bottom step */
+                gap: 0;
+                align-items: center;
+                justify-content: center;
+                margin: 2rem 0;
+            }
+            
+            /* Mobile/Vertical Flow Connector */
+            .arrow-vertical-down {
+                width: 3px;
+                height: 20px;
+                background-color: #4f46e5;
+                margin: 5px 0;
+                position: relative;
+            }
+            .arrow-vertical-down::after {
+                content: '';
+                position: absolute;
+                bottom: -4px;
+                left: 50%;
+                width: 0;
+                height: 0;
+                border-left: 5px solid transparent;
+                border-right: 5px solid transparent;
+                border-top: 5px solid #4f46e5;
+                transform: translateX(-50%);
+            }
+            /* Hiding SVG elements on mobile for simplicity */
+            @media (max-width: 1024px) {
+                .flow-wrapper {
+                    display: flex;
+                    flex-direction: column;
+                    align-items: stretch;
+                    gap: 1rem;
+                    padding: 0 10px;
+                }
+                .flow-step-vertical { width: 100% !important; }
+                .svg-flow-desktop { display: none; }
+            }
+
+            /* Custom Desktop Arrows for Diamond Flow (1->2->3->4->1) */
+            @media (min-width: 1025px) {
+                .flow-wrapper {
+                    display: grid;
+                    grid-template-rows: 1fr 30px 1fr;
+                    grid-template-columns: 1fr 40px 1fr 40px 1fr 40px 1fr;
+                    gap: 0;
+                }
+                .flow-step-vertical {
+                    grid-row: unset;
+                }
+                
+                /* Positioning the boxes */
+                .flow-wrapper > .flow-step-vertical:nth-child(1) { grid-column: 4; grid-row: 1; } /* Import */
+                .flow-wrapper > .flow-step-vertical:nth-child(2) { grid-column: 7; grid-row: 2; } /* Define/Read Edits */
+                .flow-wrapper > .flow-step-vertical:nth-child(3) { grid-column: 4; grid-row: 3; } /* Run Engine */
+                .flow-wrapper > .flow-step-vertical:nth-child(4) { grid-column: 1; grid-row: 2; } /* Export */
+                
+                /* Hiding Mobile Flow Connector */
+                .flow-diagram-wrapper { display: none !important; }
+            }
+
+            /* ERD Styles */
+            .erd-container {
+                width: 100%;
+                height: 500px;
+                background-color: #fcfcfd;
+                border: 2px solid #e0e7ff;
+                border-radius: 12px;
+                position: relative;
+                overflow: hidden;
+            }
+            .erd-node {
+                position: absolute;
+                background-color: white;
+                border-radius: 8px;
+                box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
+                padding: 10px 15px;
+                cursor: grab;
+                min-width: 150px;
+                z-index: 10;
+                font-size: 0.85rem;
+                border: 1px solid #c7d2fe;
+                transition: box-shadow 0.2s;
+            }
+            .erd-node:active {
+                cursor: grabbing;
+                box-shadow: 0 4px 10px rgba(79, 70, 229, 0.4);
+            }
+            .node-title {
+                font-weight: 700;
+                border-bottom: 2px solid #4f46e5;
+                padding-bottom: 3px;
+                margin-bottom: 5px;
+                color: #312e81;
+            }
+            .node-type-rules { border-left: 5px solid #10b981; }
+            .node-type-source { border-left: 5px solid #f59e0b; }
+            .node-type-target { border-left: 5px solid #ef4444; }
+            
+            .erd-svg {
+                position: absolute;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 100%;
+                z-index: 5;
+            }
+
+            /* Relational CRTs Styles */
+            .file-box {
+                background: #f1f5f9;
+                border: 1px solid #cbd5e1;
+                border-radius: 8px;
+                padding: 15px;
+                box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+                min-width: 200px;
+                max-height: 300px;
+                overflow-y: auto;
+            }
+            .validation-result {
+                padding: 10px;
+                border-radius: 8px;
+                margin-top: 15px;
+                font-weight: 600;
+            }
+            .validation-ok {
+                background-color: #d1fae5;
+                color: #065f46;
+            }
+            .validation-error {
+                background-color: #fee2e2;
+                color: #991b1b;
+            }
+            
+            /* Relationship Drag-and-Drop styles */
+            .rel-column-selector {
+                position: relative;
+                display: flex;
+                align-items: center;
+            }
+            .column-item {
+                padding: 6px 12px;
+                background-color: #eef2ff;
+                border: 1px solid #c7d2fe;
+                border-radius: 6px;
+                cursor: pointer;
+                user-select: none;
+                transition: background-color 0.1s;
+                font-size: 0.9rem;
+                margin-bottom: 4px;
+            }
+            .column-item:hover {
+                background-color: #dbeafe;
+            }
+            .column-item.active {
+                background-color: #4f46e5;
+                color: white;
+                font-weight: 600;
+                box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.5);
+            }
+            .relationship-link-display {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                padding: 8px;
+                background-color: #f8fafc;
+                border: 1px solid #e2e8f0;
+                border-radius: 8px;
+            }
+            .rel-link-box {
+                background-color: #e0e7ff;
+                padding: 10px;
+                border-radius: 8px;
+            }
+            
+            /* Grid Table for Where Used/CRTs */
+            .small-grid th, .small-grid td {
+                padding: 6px 8px;
+                font-size: 0.75rem;
+                border: 1px solid #e0e7ff;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            .small-grid th {
+                background-color: #312e81;
+                color: white;
+                position: sticky;
+                top: 0;
             }
         </style>
 
@@ -344,12 +609,10 @@ interface DetailModalState {
 
                     <div class="p-4 border border-gray-200 rounded-b-lg mt-0 bg-white">
                         <!-- Detail Tab Content -->
-                        <div *ngIf="detailModal().tab === 'detail'" class="space-y-3">
-                            <div *ngIf="detailModal().row as row">
-                                <div *ngFor="let col of visibleColumns()" class="flex justify-between py-1 border-b border-gray-100">
-                                    <span class="font-medium text-gray-600">{{ col.name }}:</span>
-                                    <span class="text-gray-800">{{ row[col.name] }}</span>
-                                </div>
+                        <div *ngIf="detailModal().row as row">
+                            <div *ngFor="let col of visibleColumns()" class="flex justify-between py-1 border-b border-gray-100">
+                                <span class="font-medium text-gray-600">{{ col.name }}:</span>
+                                <span class="text-gray-800">{{ row[col.name] }}</span>
                             </div>
                         </div>
 
@@ -357,8 +620,8 @@ interface DetailModalState {
                         <div *ngIf="detailModal().tab === 'api'" class="space-y-4">
                             <select 
                                 name="apiLookupColumn"
-                                [ngModel]="detailModal().apiConfig?.columnName || ''" 
-                                (ngModelChange)="setApiLookupColumn($event)"
+                                [value]="detailModal().apiConfig?.columnName || ''" 
+                                (change)="setApiLookupColumn($event.target.value)"
                                 class="w-full p-2 border border-gray-300 rounded-lg text-sm">
                                 <option value="" disabled>Select Column for API Lookup...</option>
                                 <option *ngFor="let config of apiConfigList()" [value]="config.columnName">
@@ -372,7 +635,7 @@ interface DetailModalState {
 
                             <button 
                                 (click)="runSingleRowApiLookup()" 
-                                [disabled]="!detailModal().apiConfig || isLoading()"
+                                [disabled]="isLoading()"
                                 class="w-full py-2 bg-indigo-500 text-white font-bold rounded-lg hover:bg-indigo-600 transition disabled:opacity-50">
                                 Run API Lookup
                             </button>
@@ -414,7 +677,7 @@ interface DetailModalState {
             <!-- HEADER -->
             <header class="bg-white shadow-md p-4 flex justify-between items-center z-20">
                 <div class="flex items-center space-x-4">
-                    <h1 class="text-2xl font-extrabold text-indigo-800 tracking-tight">Wabbat</h1>
+                    <h1 class="text-2xl font-extrabold text-indigo-800 tracking-tight">ConfigFlow</h1>
                     <span class="text-sm text-gray-500 hidden sm:inline">Configuration Manager for UKG PRO WFM</span>
                 </div>
                 
@@ -422,9 +685,16 @@ interface DetailModalState {
                     <span class="text-sm text-gray-600 font-medium hidden sm:inline">
                         User: {{ currentProfile().email }} ({{ currentProfile().licenseType }})
                     </span>
+                    <!-- LOGOUT FUNCTIONALITY KEPT FOR STATE RESET -->
                     <button (click)="logout()" class="px-4 py-2 bg-red-500 text-white rounded-lg shadow-md hover:bg-red-600 transition text-sm font-semibold">
                         Logout
                     </button>
+                </div>
+                
+                <div *ngIf="isLandingView() || isAuthView() || isContactView()" class="flex items-center space-x-4 text-sm font-medium">
+                    <!-- FIX: Ensure navigation uses the navigateTo method correctly -->
+                    <button (click)="navigateTo('landing')" class="text-indigo-600 hover:text-indigo-800 transition">About ConfigFlow</button>
+                    <button (click)="navigateTo('contact')" class="text-indigo-600 hover:text-indigo-800 transition">Contact Us</button>
                 </div>
             </header>
 
@@ -435,11 +705,69 @@ interface DetailModalState {
                     <div class="flex flex-col lg:flex-row items-center bg-white p-10 rounded-2xl shadow-xl space-y-8 lg:space-y-0 lg:space-x-12">
                         <div class="lg:w-1/2 space-y-6">
                             <h2 class="text-5xl font-extrabold text-gray-900 leading-tight">
-                                Automate UKG Config Edits with <span class="text-indigo-600">Wabbat Rule Sets</span>
+                                The UKG WFM Efficiency Layer. Achieve 80% Faster Config Edits with <span class="text-indigo-600">ConfigFlow Rule Sets</span>
                             </h2>
                             <p class="text-xl text-gray-600">
-                                Wabbat is the essential configuration management tool for UKG PRO WFM and PRO Suite customers. Stop manual data entry and start managing configurations using complex **IF/THEN Rule Sets** for single or batch field edits.
+                                **ConfigFlow** acts as a **strategic accelerator** for UKG WFM maintenance. We minimize high-volume, low-value work by moving beyond the native one-at-a-time modifications, empowering your team to manage complex configuration data quickly, accurately, and with full confidence.
                             </p>
+                            <h3 class="2xl font-bold text-indigo-700 pt-4">The ConfigFlow Maintenance Cycle:</h3>
+                            
+                            <!-- Flow Diagram Container -->
+                            <div class="flow-wrapper relative">
+                                
+                                <!-- Step 1: IMPORT (Top Center - Grid Col 4) -->
+                                <div class="flow-step-vertical" style="grid-column: 4; grid-row: 1;">
+                                    <div class="flow-box">1. Import SDM File</div>
+                                </div>
+                                
+                                <!-- Step 2: DEFINE/READ (Top Left - Grid Col 1) -->
+                                <div class="flow-step-vertical" style="grid-column: 7; grid-row: 2;">
+                                    <div class="flow-box">2. Define/Read Edit Rules</div>
+                                </div>
+                                
+                                <!-- Step 3: RUN (Bottom Center - Grid Col 4) -->
+                                <div class="flow-step-vertical" style="grid-column: 4; grid-row: 3;">
+                                    <div class="flow-box">3. Run Engine</div>
+                                </div>
+                                
+                                <!-- Step 4: EXPORT (Top Right - Grid Col 7) -->
+                                <div class="flow-step-vertical" style="grid-column: 1; grid-row: 2;">
+                                    <div class="flow-box">4. Export SDM File</div>
+                                </div>
+
+                                <!-- SVG Definitions for Arrows (Desktop Only) -->
+                                <svg class="erd-svg svg-flow-desktop hidden lg:block" width="100%" height="100%" style="grid-column: 1 / span 7; grid-row: 1 / span 3; overflow: visible;">
+                                    <defs>
+                                        <marker id="arrowhead-flow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+                                            <polygon points="0 0, 10 5, 0 10" fill="#4f46e5" />
+                                        </marker>
+                                    </defs>
+                                    
+                                    <!-- 1. IMPORT (4,1) -> DEFINE/READ (7,2) -->
+                                    <path d="M 47% 10% C 65% 10%, 80% 30%, 85% 45%" stroke="#4f46e5" stroke-width="3" fill="none" marker-end="url(#arrowhead-flow)" />
+                                    
+                                    <!-- 2. DEFINE/READ (7,2) -> RUN (4,3) -->
+                                    <path d="M 85% 55% C 80% 70%, 65% 90%, 53% 90%" stroke="#4f46e5" stroke-width="3" fill="none" marker-end="url(#arrowhead-flow)" />
+                                    
+                                    <!-- 3. RUN (4,3) -> EXPORT (1,2) -->
+                                    <path d="M 47% 90% C 30% 90%, 15% 70%, 15% 55%" stroke="#4f46e5" stroke-width="3" fill="none" marker-end="url(#arrowhead-flow)" />
+                                    
+                                    <!-- 4. EXPORT (1,2) -> IMPORT (4,1) (Cycle) -->
+                                    <path d="M 15% 45% C 20% 30%, 35% 10%, 47% 10%" stroke="#4f46e5" stroke-width="3" fill="none" marker-end="url(#arrowhead-flow)" />
+                                </svg>
+
+                                <!-- Simple Stacked Mobile Flow (Mobile Only) -->
+                                <div class="flow-diagram-wrapper lg:hidden">
+                                    <div class="flow-box" style="width: 100%;">1. Import SDM File</div>
+                                    <div class="arrow-vertical-down"></div>
+                                    <div class="flow-box" style="width: 100%;">2. Define/Read Edit Rules</div>
+                                    <div class="arrow-vertical-down"></div>
+                                    <div class="flow-box" style="width: 100%;">3. Run Transformation Engine</div>
+                                    <div class="arrow-vertical-down"></div>
+                                    <div class="flow-box" style="width: 100%;">4. Export SDM File</div>
+                                </div>
+                            </div>
+                            
                             <div class="pt-4 space-x-4">
                                 <button (click)="navigateTo('login')" class="px-8 py-3 bg-indigo-600 text-white text-lg font-bold rounded-lg shadow-lg hover:bg-indigo-700 transition transform hover:scale-105">
                                     Login
@@ -450,7 +778,7 @@ interface DetailModalState {
                             </div>
                         </div>
                         <div class="lg:w-1/2 flex justify-center">
-                            <img src="https://placehold.co/600x350/a5b4fc/ffffff?text=Wabbat+App+Interface+GIF" alt="Wabbat App Interface" class="rounded-xl shadow-2xl border-4 border-indigo-200" />
+                            <img src="https://placehold.co/600x350/a5b4fc/ffffff?text=ConfigFlow+App+Interface+GIF" alt="ConfigFlow App Interface" class="rounded-xl shadow-2xl border-4 border-indigo-200" />
                         </div>
                     </div>
 
@@ -480,7 +808,7 @@ interface DetailModalState {
                                 <h4 class="text-2xl font-bold mb-2">Basic</h4>
                                 <p class="text-4xl font-extrabold mb-4">$299.99/yr</p>
                                 <ul class="space-y-2 text-sm">
-                                    <li class="flex items-center"><svg class="w-5 h-5 mr-2 text-green-500" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd"></path></svg>Data Sort & Row Edit</li>
+                                    <li class="flex items-center"><svg class="w-5 h-5 mr-2 text-green-500" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd"></path></svg>Data Grid & Sort</li>
                                     <li class="flex items-center"><svg class="w-5 h-5 mr-2 text-green-500" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd"></path></svg>Row Insert/Replicate</li>
                                     <li class="flex items-center text-red-500"><svg class="w-5 h-5 mr-2" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clip-rule="evenodd"></path></svg>IF/THEN Engine</li>
                                 </ul>
@@ -524,71 +852,122 @@ interface DetailModalState {
 
                     <!-- Footer / Legal -->
                     <footer class="text-center text-sm text-gray-500 pt-8 border-t border-gray-200">
-                        <p>&copy; 2024 Wabbat Configuration Manager. All rights reserved.</p>
+                        <p>&copy; 2024 ConfigFlow Configuration Manager. All rights reserved.</p>
                         <p>SSO sign-in requires Enterprise license and existing corporate identity management integration.</p>
                     </footer>
                 </div>
             </div>
 
+            <!-- CONTACT PAGE -->
+            <div *ngIf="isContactView()" class="p-8 flex-grow">
+                <div class="flex-grow flex items-center justify-center">
+                    <div class="bg-white p-8 rounded-2xl shadow-2xl w-full max-w-lg">
+                        <h2 class="text-3xl font-bold text-indigo-600 mb-4">Contact Our Sales Team</h2>
+                        <p class="text-gray-600 mb-6">Interested in transforming your UKG WFM maintenance cycle? Reach out to schedule a demo or inquire about licensing.</p>
+
+                        <div class="space-y-6">
+                            <div class="p-4 bg-indigo-50 rounded-lg">
+                                <h3 class="font-bold text-indigo-800 mb-2">General Sales & Inquiries</h3>
+                                <p class="text-indigo-700">Email: <a href="mailto:sales@configflow.com" class="font-semibold hover:underline">sales@configflow.com</a></p>
+                                <p class="text-indigo-700">Phone: (888) CONFIG-FLOW</p>
+                            </div>
+
+                            <form class="space-y-4" (ngSubmit)="contactSubmit()">
+                                <input type="text" placeholder="Your Name" name="contactName" required class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                                <input type="email" placeholder="Work Email" name="contactEmail" required class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                                <textarea placeholder="Tell us about your UKG maintenance challenge..." name="contactMessage" rows="4" required class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500"></textarea>
+                                
+                                <button 
+                                    type="submit" 
+                                    class="w-full py-3 bg-indigo-600 text-white font-bold rounded-lg shadow-md hover:bg-indigo-700 transition">
+                                    Send Inquiry
+                                </button>
+                            </form>
+                            <p *ngIf="contactMessageStatus()" class="mt-4 text-center text-sm font-semibold" [ngClass]="{'text-green-600': contactMessageStatus() === 'Sent!', 'text-red-600': contactMessageStatus() !== 'Sent!'}">
+                                {{ contactMessageStatus() }}
+                            </p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+
             <!-- LOGIN/REGISTER PAGE -->
             <div *ngIf="isAuthView()" class="flex-grow flex items-center justify-center p-4">
                 <div class="bg-white p-8 rounded-2xl shadow-2xl w-full max-w-lg">
-                    <h2 class="text-3xl font-bold text-indigo-600 mb-2">{{ isLoginView() ? 'Sign In to Wabbat' : (authState().isAdditionalPurchase ? 'Purchase Additional Licenses' : 'New Account Registration') }}</h2>
+                    <h2 class="text-3xl font-bold text-indigo-600 mb-2">{{ isLoginView() ? 'Sign In to ConfigFlow' : (authState().isAdditionalPurchase ? 'Purchase Additional Licenses' : 'New Account Registration') }}</h2>
                     <p class="text-gray-500 mb-6">{{ isLoginView() ? 'Enter your credentials to access the tool.' : 'Secure your licenses and complete your account setup.' }}</p>
 
-                    <form #authForm="ngModel" (ngSubmit)="handleAuthSubmit(authForm)">
+                    <!-- Using [value] and (input)/(change) to bypass problematic NgModel resolution -->
+                    <form (ngSubmit)="handleAuthSubmit()">
                         <div *ngIf="authState().error" class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative mb-4" role="alert">
                             <span class="block sm:inline">{{ authState().error }}</span>
                         </div>
 
                         <!-- Registration Fields (Non-Admin users skip these) -->
                         <div *ngIf="isRegisterView() && !authState().isAdditionalPurchase" class="space-y-4 mb-6">
-                            <input type="text" placeholder="Your Full Name (Admin)" name="name" [ngModel]="authState().name" (ngModelChange)="updateAuthField('name', $event)" required class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
-                            <input type="text" placeholder="Organization Name" name="orgName" [ngModel]="authState().organizationName" (ngModelChange)="updateAuthField('organizationName', $event)" required class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                            <input type="text" placeholder="Your Full Name (Admin)" name="name" [value]="authState().name" (input)="updateAuthField('name', $event.target.value)" required class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                            <input type="text" placeholder="Organization Name" name="orgName" [value]="authState().organizationName" (input)="updateAuthField('organizationName', $event.target.value)" required class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
                             
-                            <select name="selectedLicenseType" [ngModel]="authState().selectedLicenseType" (ngModelChange)="updateLicenseDetails($event)" required class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                            <select name="selectedLicenseType" [value]="authState().selectedLicenseType" (change)="updateLicenseDetails($event.target.value)" required class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
                                 <option value="" disabled>Select License Type...</option>
-                                <option *ngFor="let key of licenseTypes" [value]="key">{{ getLicenseOptionText(key) }}</option>
+                                <option *ngFor="let key of licenseTypes()" [value]="key">{{ getLicenseOptionText(key) }}</option>
                             </select>
                             
-                            <input type="number" name="licensesToPurchase" [ngModel]="licensesToPurchase()" (ngModelChange)="updateLicensesToPurchase($event)" [min]="1" required class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                            <input type="number" name="licensesToPurchase" [value]="authState().licensesToPurchase" (input)="updateLicensesToPurchase($event.target.value)" [min]="1" required class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
                             
                             <div class="p-3 bg-indigo-50 rounded-lg">
-                                <p class="font-semibold text-sm text-indigo-800">License 1 (Admin Seat)</p>
-                                <input type="email" placeholder="Primary Admin Email" name="email" [ngModel]="authState().email" (ngModelChange)="updateAuthField('email', $event)" required class="w-full p-2 mt-1 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500" [disabled]="!!authState().isAdditionalPurchase">
+                                <label class="font-semibold text-sm text-indigo-800">License 1 (Admin Seat)</label>
+                                <input type="email" placeholder="Primary Admin Email" name="email" [value]="authState().email" (input)="updateAuthField('email', $event.target.value)" required class="w-full p-2 mt-1 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500" [disabled]="!!authState().isAdditionalPurchase">
+                                <input type="hidden" [value]="authState().selectedLicenseType" name="adminLicenseType">
                             </div>
                         </div>
 
                         <!-- Additional Purchase Fields -->
                         <div *ngIf="isRegisterView() && authState().isAdditionalPurchase" class="space-y-4 mb-6">
                             <h3 class="text-xl font-semibold text-gray-700">Licenses to Purchase:</h3>
-                            <input type="number" name="licensesToPurchase" [ngModel]="licensesToPurchase()" (ngModelChange)="updateLicensesToPurchase($event)" [min]="1" required class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                            <input type="number" name="licensesToPurchase" [value]="authState().licensesToPurchase" (input)="updateLicensesToPurchase($event.target.value)" [min]="1" required class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
                         </div>
                         
                         <!-- Email and Password Fields (Common to both) -->
                         <div class="space-y-4 mb-6">
+                            <!-- Show primary email if not additional purchase, otherwise just show secondary licenses -->
+                            <div *ngIf="isLoginView()" class="space-y-2">
+                                <label class="font-medium text-gray-700 text-sm">Email Address</label>
+                                <input 
+                                    name="loginEmail"
+                                    type="email" 
+                                    placeholder="Your Login Email" 
+                                    [value]="authState().email" 
+                                    (input)="updateAuthField('email', $event.target.value)"
+                                    required 
+                                    class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500"
+                                >
+                            </div>
+
+                            <!-- License assignment for secondary licenses during registration/purchase -->
                             <div class="space-y-2" *ngFor="let license of licensesToPurchaseArray(); let i = index">
                                 <label class="font-medium text-gray-700 text-sm">Seat {{ license.seatIndex }}: Email Address</label>
                                 <input 
                                     [name]="'licenseEmail_' + license.seatIndex"
                                     type="email" 
                                     [placeholder]="'Seat ' + license.seatIndex + ' Email Address'" 
-                                    [ngModel]="licenseEmails()[i].email" 
-                                    (ngModelChange)="updateLicenseEmail(i, 'email', $event)"
+                                    [value]="licenseEmails()[i].email" 
+                                    (input)="updateLicenseEmail(i, 'email', $event.target.value)"
                                     required 
                                     class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500"
                                 >
                                 <!-- License Type Radio Buttons -->
-                                <div class="flex items-center space-x-3 mt-1">
+                                <div class="flex flex-wrap items-center space-x-3 mt-1">
                                     <span class="text-sm font-medium text-gray-500 mr-2">License:</span>
-                                    <div *ngFor="let type of licenseTypes" class="flex items-center">
+                                    <div *ngFor="let type of licenseTypes()" class="flex items-center">
                                         <input 
                                             [id]="'seat' + license.seatIndex + '-' + type" 
                                             [name]="'licenseType_' + license.seatIndex" 
                                             type="radio" 
                                             [value]="type"
-                                            [ngModel]="licenseEmails()[i].licenseType"
-                                            (ngModelChange)="updateLicenseEmail(i, 'licenseType', $event)"
+                                            [checked]="licenseEmails()[i].licenseType === type"
+                                            (change)="updateLicenseEmail(i, 'licenseType', $event.target.value)"
                                             class="w-4 h-4 text-indigo-600 focus:ring-indigo-500"
                                             [required]="true"
                                         >
@@ -598,12 +977,11 @@ interface DetailModalState {
                             </div>
 
                             <!-- Password Field -->
-                            <input type="password" placeholder="Password" name="password" [ngModel]="authState().password" (ngModelChange)="updateAuthField('password', $event)" required class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                            <input type="password" placeholder="Password" name="password" [value]="authState().password" (input)="updateAuthField('password', $event.target.value)" required class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
                         </div>
 
                         <button 
                             type="submit" 
-                            [disabled]="authForm.invalid || isLoading()" 
                             class="w-full py-3 bg-indigo-600 text-white font-bold rounded-lg shadow-md hover:bg-indigo-700 transition disabled:opacity-50">
                             {{ isLoginView() ? 'Sign In' : 'Complete Registration & Purchase' }}
                         </button>
@@ -630,16 +1008,22 @@ interface DetailModalState {
                             <button (click)="mainTab.set('my-profile')" [class]="tabClass('my-profile')">My Profile</button>
                         </li>
                         <li class="mr-2">
-                            <button (click)="mainTab.set('data-grid')" [class]="tabClass('data-grid')">Data Grid ({{ dataRows().length }} rows)</button>
+                            <button (click)="mainTab.set('data-grid')" [class]="tabClass('data-grid')">Rule Set (Data) ({{ dataRows().length }} rows)</button>
                         </li>
                         <li class="mr-2">
-                            <button [disabled]="!canUseEngine()" (click)="mainTab.set('engine')" [class]="tabClass('engine')">IF/THEN Transformation Engine</button>
+                            <button (click)="mainTab.set('engine')" [class]="tabClass('engine')">IF/THEN Transformation Engine</button>
                         </li>
                         <li class="mr-2">
-                            <button [disabled]="!canUseApi()" (click)="mainTab.set('api-config')" [class]="tabClass('api-config')">API Cross-Reference</button>
+                            <button (click)="mainTab.set('api-config')" [class]="tabClass('api-config')">API Cross-Reference</button>
                         </li>
                         <li class="mr-2">
-                            <button [disabled]="!currentProfile().isAdmin" (click)="mainTab.set('org-admin')" [class]="tabClass('org-admin')">Organization Admin</button>
+                            <button (click)="mainTab.set('org-admin')" [class]="tabClass('org-admin')">License Admin</button>
+                        </li>
+                        <li class="mr-2">
+                            <button (click)="mainTab.set('where-used')" [class]="tabClass('where-used')">Where Used?</button>
+                        </li>
+                        <li class="mr-2">
+                            <button (click)="mainTab.set('relational-crts')" [class]="tabClass('relational-crts')">Relational CRTs</button>
                         </li>
                         <li class="mr-2">
                             <button (click)="mainTab.set('support')" [class]="tabClass('support')">Support & Feedback</button>
@@ -663,7 +1047,7 @@ interface DetailModalState {
 
                     <!-- Organization Admin Tab -->
                     <div *ngIf="mainTab() === 'org-admin'" class="space-y-8">
-                        <h2 class="text-3xl font-bold text-indigo-800">Organization Administration</h2>
+                        <h2 class="text-3xl font-bold text-indigo-800">License Administration</h2>
                         
                         <!-- Account Summary -->
                         <div class="grid grid-cols-1 md:grid-cols-3 gap-6 bg-indigo-50 p-6 rounded-xl border border-indigo-200">
@@ -675,8 +1059,8 @@ interface DetailModalState {
                         <!-- License Management -->
                         <div class="space-y-4 p-6 bg-white rounded-xl shadow">
                             <div class="flex justify-between items-center border-b pb-2 mb-4">
-                                <h3 class="text-xl font-semibold text-gray-700">Assigned Licenses</h3>
-                                <button (click)="navigateTo('register'); authState.update(s => ({...s, isAdditionalPurchase: true}))" class="px-4 py-2 bg-green-600 text-white rounded-lg shadow-md hover:bg-green-700 transition text-sm font-semibold">
+                                <h3 class="font-semibold text-gray-700 text-xl">Assigned Licenses</h3>
+                                <button (click)="handlePurchaseMoreLicenses()" class="px-4 py-2 bg-green-600 text-white rounded-lg shadow-md hover:bg-green-700 transition text-sm font-semibold">
                                     Purchase More Licenses
                                 </button>
                             </div>
@@ -706,15 +1090,15 @@ interface DetailModalState {
                             <div class="space-y-4">
                                 <div>
                                     <label class="block text-sm font-medium text-gray-700">Base API URL (v2 endpoints)</label>
-                                    <input type="text" name="apiBaseUrl" [ngModel]="currentProfile().apiBaseUrl" (ngModelChange)="updateProfileField('apiBaseUrl', $event)" class="w-full p-3 border border-gray-300 rounded-lg" placeholder="https://api.ukgpro.com/v2/...">
+                                    <input type="text" name="apiBaseUrl" [value]="currentProfile().apiBaseUrl" (input)="updateProfileField('apiBaseUrl', $event.target.value)" class="w-full p-3 border border-gray-300 rounded-lg" placeholder="https://api.ukgpro.com/v2/...">
                                 </div>
                                 <div>
                                     <label class="block text-sm font-medium text-gray-700">Authentication Token (Bearer)</label>
-                                    <input type="password" name="apiAuthToken" [ngModel]="currentProfile().apiAuthToken" (ngModelChange)="updateProfileField('apiAuthToken', $event)" class="w-full p-3 border border-gray-300 rounded-lg" placeholder="Enter Bearer Token (e.g., JWT)">
+                                    <input type="password" name="apiAuthToken" [value]="currentProfile().apiAuthToken" (input)="updateProfileField('apiAuthToken', $event.target.value)" class="w-full p-3 border border-gray-300 rounded-lg" placeholder="Enter Bearer Token (e.g., JWT)">
                                 </div>
                                 <div>
                                     <label class="block text-sm font-medium text-gray-700">Target Environment</label>
-                                    <select name="apiEnvironment" [ngModel]="currentProfile().apiEnvironment" (ngModelChange)="updateProfileField('apiEnvironment', $event)" class="w-full p-3 border border-gray-300 rounded-lg">
+                                    <select name="apiEnvironment" [value]="currentProfile().apiEnvironment" (change)="updateProfileField('apiEnvironment', $event.target.value)" class="w-full p-3 border border-gray-300 rounded-lg">
                                         <option value="prod">Production</option>
                                         <option value="staging">Staging</option>
                                         <option value="sandbox">Sandbox/Development</option>
@@ -744,7 +1128,384 @@ interface DetailModalState {
                             </div>
                         </div>
                     </div>
+
+                    <!-- Where Used? Tab (New Feature) -->
+                    <div *ngIf="mainTab() === 'where-used'" class="space-y-6">
+                        <h2 class="text-3xl font-bold text-indigo-800">Where Used? Configuration Dependency Map</h2>
+                        <p class="text-gray-600">Visually map how your **Rule Set** results affect or depend on columns in two external configuration files (Reference 1 and Reference 2).</p>
+
+                        <!-- File Management & Map Generation -->
+                        <div class="p-4 bg-gray-50 rounded-xl shadow-sm space-y-4">
+                            <h3 class="text-xl font-semibold text-gray-700">File Management</h3>
+                            <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                                
+                                <!-- File A: Rule Set Data (Implicitly loaded from Data Grid/Engine) -->
+                                <div class="space-y-2">
+                                    <p class="font-medium text-gray-700">File A: Rule Set Data (Source)</p>
+                                    <div class="file-box bg-indigo-100 border-indigo-500">
+                                        <p class="font-bold text-sm mb-1">Rule Set Data ({{ dataRows().length }} rows)</p>
+                                        <button (click)="refreshWhereUsedFileA()" class="px-3 py-1 bg-indigo-600 text-white rounded-lg text-xs hover:bg-indigo-700 w-full mt-1">
+                                            Refresh Columns
+                                        </button>
+                                        <p class="text-xs mt-2 text-indigo-800">
+                                            Columns: **{{ columnConfig().length }}**
+                                        </p>
+                                    </div>
+                                </div>
+
+                                <!-- File B: Reference 1 -->
+                                <div class="space-y-2">
+                                    <p class="font-medium text-gray-700">File B: Reference 1</p>
+                                    <div class="file-box">
+                                        <p class="font-bold text-sm mb-1">{{ whereUsedFiles().B.name }}</p>
+                                        <button (click)="importWhereUsedFile('B')" class="px-3 py-1 bg-yellow-600 text-white rounded-lg text-xs hover:bg-yellow-700 w-full mt-1">
+                                            Import File B
+                                        </button>
+                                        <p class="text-xs mt-2" [ngClass]="{'text-green-600': whereUsedFiles().B.keys.length, 'text-red-600': !whereUsedFiles().B.keys.length}">
+                                            Columns: **{{ whereUsedFiles().B.keys.length }}**
+                                        </p>
+                                    </div>
+                                </div>
+                                
+                                <!-- File C: Reference 2 -->
+                                <div class="space-y-2">
+                                    <p class="font-medium text-gray-700">File C: Reference 2</p>
+                                    <div class="file-box">
+                                        <p class="font-bold text-sm mb-1">{{ whereUsedFiles().C.name }}</p>
+                                        <button (click)="importWhereUsedFile('C')" class="px-3 py-1 bg-yellow-600 text-white rounded-lg text-xs hover:bg-yellow-700 w-full mt-1">
+                                            Import File C
+                                        </button>
+                                        <p class="text-xs mt-2" [ngClass]="{'text-green-600': whereUsedFiles().C.keys.length, 'text-red-600': !whereUsedFiles().C.keys.length}">
+                                            Columns: **{{ whereUsedFiles().C.keys.length }}**
+                                        </p>
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <div class="flex justify-between items-center space-x-4 pt-4 border-t border-gray-300">
+                                <button (click)="generateErd()" [disabled]="!isErdReady()" class="px-6 py-3 bg-green-600 text-white font-bold rounded-lg shadow hover:bg-green-700 transition disabled:opacity-50">Generate Dependency Map</button>
+                                
+                                <button (click)="saveWhereUsedMap()" [disabled]="!isErdReady()" class="px-4 py-3 bg-indigo-500 text-white rounded-lg text-sm font-bold hover:bg-indigo-600">Save Dependency Map</button>
+                            </div>
+                        </div>
+
+                        <!-- Search and Grids Area -->
+                        <div class="space-y-4">
+                             <input type="text" 
+                                placeholder="Global Search: Enter value to filter all three files (e.g., 'MGR201')" 
+                                [value]="relationalSearchTerm()" 
+                                (input)="relationalSearchTerm.set($event.target.value)"
+                                class="w-full p-3 border-2 border-indigo-300 rounded-xl focus:border-indigo-500">
+
+                            <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                                <!-- Grid 1 (File A: Rule Set Data) -->
+                                <div class="space-y-2">
+                                    <h4 class="font-semibold text-lg text-indigo-700">{{ whereUsedFiles().A.name }} - ({{ filteredFileA().length }} rows)</h4>
+                                    <div class="file-box h-64 overflow-y-auto">
+                                        <div *ngIf="filteredFileA().length === 0" class="text-center text-gray-500 pt-8">No data found.</div>
+                                        <table *ngIf="filteredFileA().length > 0 && whereUsedFiles().A.keys.length > 0" class="w-full small-grid">
+                                            <thead>
+                                                <tr class="bg-indigo-50 sticky top-0">
+                                                    <th *ngFor="let key of whereUsedFiles().A.keys" class="p-2 border-b">{{ key }}</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                <tr *ngFor="let row of filteredFileA()" class="border-b">
+                                                    <td *ngFor="let key of whereUsedFiles().A.keys" class="p-2">{{ row[key] }}</td>
+                                                </tr>
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </div>
+
+                                <!-- Grid 2 (File B: Reference 1) -->
+                                <div class="space-y-2">
+                                    <h4 class="font-semibold text-lg text-yellow-700">{{ whereUsedFiles().B.name }} - ({{ filteredFileB().length }} rows)</h4>
+                                    <div class="file-box h-64 overflow-y-auto">
+                                        <div *ngIf="filteredFileB().length === 0" class="text-center text-gray-500 pt-8">No data found.</div>
+                                        <table *ngIf="filteredFileB().length > 0 && whereUsedFiles().B.keys.length > 0" class="w-full small-grid">
+                                            <thead>
+                                                <tr class="bg-yellow-50 sticky top-0">
+                                                    <th *ngFor="let key of whereUsedFiles().B.keys" class="p-2 border-b">{{ key }}</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                <tr *ngFor="let row of filteredFileB()" class="border-b">
+                                                    <td *ngFor="let key of whereUsedFiles().B.keys" class="p-2">{{ row[key] }}</td>
+                                                </tr>
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </div>
+                                
+                                <!-- Grid 3 (File C: Reference 2) -->
+                                <div class="space-y-2">
+                                    <h4 class="font-semibold text-lg text-red-700">{{ whereUsedFiles().C.name }} - ({{ filteredFileC().length }} rows)</h4>
+                                    <div class="file-box h-64 overflow-y-auto">
+                                        <div *ngIf="filteredFileC().length === 0" class="text-center text-gray-500 pt-8">No data found.</div>
+                                        <table *ngIf="filteredFileC().length > 0 && whereUsedFiles().C.keys.length > 0" class="w-full small-grid">
+                                            <thead>
+                                                <tr class="bg-red-50 sticky top-0">
+                                                    <th *ngFor="let key of whereUsedFiles().C.keys" class="p-2 border-b">{{ key }}</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                <tr *ngFor="let row of filteredFileC()" class="border-b">
+                                                    <td *ngFor="let key of whereUsedFiles().C.keys" class="p-2">{{ row[key] }}</td>
+                                                </tr>
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Map Naming and ERD (Kept for completeness) -->
+                        <div *ngIf="isErdReady()" class="bg-white p-6 rounded-xl shadow space-y-3 border-t-4 border-indigo-500">
+                             <h3 class="text-xl font-semibold text-indigo-700">Dependency Map Visualization</h3>
+                             <div class="erd-container" #erdContainer>
+                                <!-- SVG and Node rendering for ERD goes here -->
+                                <svg class="erd-svg" [attr.width]="erdSize().width" [attr.height]="erdSize().height">
+                                    <defs>
+                                        <marker id="arrowhead-flow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+                                            <polygon points="0 0, 10 5, 0 10" fill="#4f46e5" />
+                                        </marker>
+                                        <marker id="arrowhead-source" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+                                            <polygon points="0 0, 10 5, 0 10" fill="#f59e0b" />
+                                        </marker>
+                                    </defs>
+                                    
+                                    <g *ngFor="let node of erDiagramNodes()">
+                                        <g *ngFor="let conn of node.connections">
+                                            <line *ngIf="getLineCoordinates(node, conn.targetId) as coords"
+                                                [attr.x1]="coords.x1" 
+                                                [attr.y1]="coords.y1" 
+                                                [attr.x2]="coords.x2" 
+                                                [attr.y2]="coords.y2" 
+                                                [attr.stroke]="conn.type === 'Source' ? '#f59e0b' : conn.type === 'Target' ? '#ef4444' : '#4f46e5'"
+                                                stroke-width="2" 
+                                                [attr.marker-end]="conn.type === 'Source' ? 'url(#arrowhead-source)' : 'url(#arrowhead-flow)'"
+                                            />
+                                        </g>
+                                    </g>
+                                </svg>
+                            
+                                <!-- Draggable Nodes -->
+                                <div *ngFor="let node of erDiagramNodes()" 
+                                    [attr.id]="'node-' + node.id"
+                                    [class]="'erd-node cdkDrag node-type-' + node.type"
+                                    [ngStyle]="{ 'left.px': node.x, 'top.px': node.y }"
+                                    (cdkDragMoved)="onNodeDrag($event, node.id)">
+                                    <div class="node-title">{{ node.name }}</div>
+                                    <div class="text-gray-500">{{ node.type | titlecase }} Data Point</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
                     
+                    <!-- Relational CRTs Tab (Refined Logic) -->
+                    <div *ngIf="mainTab() === 'relational-crts'" class="space-y-6">
+                        <h2 class="text-3xl font-bold text-indigo-800">Relational CRTs: Configuration Relationship Tools</h2>
+                        <p class="text-gray-600">Define and validate complex, named relationships across the Rule Set data (File A) and two reference files (File B and C). Supports Parent-Child-Grandchild dependencies.</p>
+
+                        <!-- Map Naming and Description -->
+                        <div class="bg-white p-6 rounded-xl shadow space-y-3 border-t-4 border-indigo-500">
+                            <h3 class="text-xl font-semibold text-indigo-700">Map Details (Map: {{ relationalRelationships()[0]?.mapName || 'Untitled Map' }})</h3>
+                            <input type="text" placeholder="Map Name (e.g., Global Job Code Hierarchy)" [value]="relationalRelationships()[0]?.mapName || ''" (input)="updateMapDetail('mapName', $event.target.value)" class="w-full p-3 border border-gray-300 rounded-lg">
+                            <textarea placeholder="Map Description" rows="2" [value]="relationalRelationships()[0]?.mapDescription || ''" (input)="updateMapDetail('mapDescription', $event.target.value)" class="w-full p-3 border border-gray-300 rounded-lg"></textarea>
+                            <button (click)="saveMap()" [disabled]="relationalRelationships().length === 0" class="px-4 py-2 bg-indigo-500 text-white rounded-lg text-sm hover:bg-indigo-600">Save Map</button>
+                        </div>
+                        
+                        <!-- File Import and Status -->
+                        <div class="bg-gray-50 p-4 rounded-xl shadow-sm space-y-4">
+                            <h3 class="text-xl font-semibold text-gray-700">File Management</h3>
+                            <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                                <div *ngFor="let fileId of ['A', 'B', 'C']" class="space-y-2">
+                                    <p class="font-medium text-gray-700">File {{ fileId }}</p>
+                                    <div class="file-box">
+                                        <p class="font-bold text-sm mb-1">{{ relationalFiles()[fileId].name }}</p>
+                                        <button (click)="importRelationalFile(fileId)" class="px-3 py-1 bg-yellow-600 text-white rounded-lg text-xs hover:bg-yellow-700 w-full mt-1">
+                                            Import {{ fileId }} File
+                                        </button>
+                                        <p class="text-xs mt-2" [ngClass]="{'text-green-600': relationalFiles()[fileId].keys.length, 'text-red-600': !relationalFiles()[fileId].keys.length}">
+                                            Columns: {{ relationalFiles()[fileId].keys.length }} | Rows: {{ relationalFiles()[fileId].data.length }}
+                                        </p>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <!-- Search Bar -->
+                        <input type="text" 
+                                placeholder="Global Search: Enter value to filter all three files (e.g., 'MGR201')" 
+                                [value]="relationalSearchTerm()" 
+                                (input)="relationalSearchTerm.set($event.target.value)"
+                                class="w-full p-3 border-2 border-indigo-300 rounded-xl focus:border-indigo-500">
+
+
+                        <!-- Relationship Definition -->
+                        <div class="bg-white p-6 rounded-xl shadow space-y-4">
+                            <div class="flex justify-between items-center border-b pb-2">
+                                <h3 class="text-xl font-semibold text-indigo-700">Define Relationships (A &rarr; B &rarr; C)</h3>
+                                <button (click)="addRelationship()" class="px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm hover:bg-indigo-700">Add Relationship</button>
+                            </div>
+
+                            <div *ngIf="relationalRelationships().length === 0" class="p-3 text-center text-gray-500 bg-gray-50 rounded-lg">
+                                Define relationships to start validation.
+                            </div>
+
+                            <div *ngFor="let rel of relationalRelationships(); let i = index" class="border p-3 rounded-lg space-y-2 relative border-l-4 border-indigo-400">
+                                <button (click)="removeRelationship(i)" class="absolute top-2 right-2 text-red-500 hover:text-red-700 text-sm">
+                                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                                </button>
+                                
+                                <!-- A -> B Relationship (Tier 1 to Tier 2) -->
+                                <div class="grid grid-cols-4 gap-3 items-center border-b pb-2 mb-2">
+                                    <span class="font-bold text-xs text-indigo-600 col-span-4">PARENT &rarr; CHILD (A &rarr; B)</span>
+                                    
+                                    <!-- A Column -->
+                                    <div class="rel-column-selector col-span-1">
+                                        <span (click)="selectRelationalColumn('A', rel.fileAColumn)" [class]="'column-item' + (selectedRelationalColumn()?.fileId === 'A' && selectedRelationalColumn()?.columnName === rel.fileAColumn ? ' active' : '')">
+                                            {{ rel.fileAColumn || 'Select Col A' }}
+                                        </span>
+                                    </div>
+                                    
+                                    <!-- Relation A->B -->
+                                    <select [value]="rel.fileBRelation" (change)="updateRelationship(i, 'fileBRelation', $event.target.value)" class="p-2 border rounded-lg text-sm">
+                                        <option value="1:1">1:1</option>
+                                        <option value="1:M">1:M</option>
+                                        <option value="M:M">M:M</option>
+                                        <option value="0:1">0:1</option>
+                                        <option value="0:M">0:M</option>
+                                    </select>
+                                    
+                                    <!-- B Column (Foreign Key in B pointing to A) -->
+                                    <div class="rel-column-selector col-span-1">
+                                        <span (click)="selectRelationalColumn('B', rel.fileBColumn)" [class]="'column-item' + (selectedRelationalColumn()?.fileId === 'B' && selectedRelationalColumn()?.columnName === rel.fileBColumn ? ' active' : '')">
+                                            {{ rel.fileBColumn || 'Select Col B' }}
+                                        </span>
+                                    </div>
+                                    
+                                </div>
+                                
+                                <!-- B -> C Relationship (Tier 2 to Tier 3 - Optional) -->
+                                <div class="grid grid-cols-4 gap-3 items-center pt-2">
+                                    <span class="font-bold text-xs text-indigo-600 col-span-4">CHILD &rarr; GRANDCHILD (B &rarr; C)</span>
+                                    
+                                    <!-- B Column (Parent for C) -->
+                                    <div class="rel-column-selector col-span-1">
+                                        <span (click)="selectRelationalColumn('B', rel.fileBColumn)" [class]="'column-item' + (selectedRelationalColumn()?.fileId === 'B' && selectedRelationalColumn()?.columnName === rel.fileBColumn ? ' active' : '')">
+                                            {{ rel.fileBColumn || 'Select Col B' }}
+                                        </span>
+                                    </div>
+                                    
+                                    <!-- Relation B->C -->
+                                    <select [value]="rel.fileCRelation" (change)="updateRelationship(i, 'fileCRelation', $event.target.value)" class="p-2 border rounded-lg text-sm">
+                                        <option value="1:1">1:1</option>
+                                        <option value="1:M">1:M</option>
+                                        <option value="M:M">M:M</option>
+                                        <option value="0:1">0:1</option>
+                                        <option value="0:M">0:M</option>
+                                    </select>
+                                    
+                                    <!-- C Column (Foreign Key in C pointing to B) -->
+                                    <div class="rel-column-selector col-span-1">
+                                        <span (click)="selectRelationalColumn('C', rel.fileCColumn)" [class]="'column-item' + (selectedRelationalColumn()?.fileId === 'C' && selectedRelationalColumn()?.columnName === rel.fileCColumn ? ' active' : '')">
+                                            {{ rel.fileCColumn || 'Select Col C' }}
+                                        </span>
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <div class="pt-4 flex justify-end">
+                                <button (click)="validateRelationships()" [disabled]="relationalRelationships().length === 0 || !isRelationalDataReady()" class="px-6 py-2 bg-green-600 text-white font-bold rounded-lg hover:bg-green-700 transition disabled:opacity-50">
+                                    Run Data Integrity Check
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- Validation Results -->
+                        <div *ngIf="relationalValidationResult().status !== 'IDLE'" class="bg-white p-6 rounded-xl shadow">
+                            <h3 class="text-xl font-semibold text-gray-700 border-b pb-2 mb-4">Validation Results (Map: {{ relationalRelationships()[0]?.mapName || 'Untitled' }})</h3>
+                            <div [class]="'validation-result ' + (relationalValidationResult().status === 'OK' ? 'validation-ok' : 'validation-error')">
+                                Status: {{ relationalValidationResult().status }}
+                            </div>
+                            <div *ngIf="relationalValidationResult().status === 'ERROR'" class="mt-3 space-y-2">
+                                <p class="font-semibold text-red-700">Errors Found ({{ relationalValidationResult().errors.length }}):</p>
+                                <ul class="list-disc list-inside text-sm text-red-700">
+                                    <li *ngFor="let error of relationalValidationResult().errors">{{ error }}</li>
+                                </ul>
+                            </div>
+                        </div>
+                        
+                        <!-- Filtered Data Grids -->
+                        <div class="space-y-4 pt-6">
+                            <h3 class="2xl font-bold text-gray-800 border-b pb-2">Filtered Data Views</h3>
+                            <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                                
+                                <!-- Grid 1 (File A) -->
+                                <div class="space-y-2">
+                                    <h4 class="font-semibold text-lg text-indigo-700">{{ relationalFiles().A.name }} - ({{ filteredFileA().length }} rows)</h4>
+                                    <div class="file-box h-64 overflow-y-auto">
+                                        <div *ngIf="filteredFileA().length === 0" class="text-center text-gray-500 pt-8">No data found.</div>
+                                        <table *ngIf="filteredFileA().length > 0 && relationalFiles().A.keys.length > 0" class="w-full small-grid">
+                                            <thead>
+                                                <tr class="bg-indigo-50 sticky top-0">
+                                                    <th *ngFor="let key of relationalFiles().A.keys" class="p-2 border-b">{{ key }}</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                <tr *ngFor="let row of filteredFileA()" class="border-b">
+                                                    <td *ngFor="let key of relationalFiles().A.keys" class="p-2">{{ row[key] }}</td>
+                                                </tr>
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </div>
+
+                                <!-- Grid 2 (File B) -->
+                                <div class="space-y-2">
+                                    <h4 class="font-semibold text-lg text-yellow-700">{{ relationalFiles().B.name }} - ({{ filteredFileB().length }} rows)</h4>
+                                    <div class="file-box h-64 overflow-y-auto">
+                                        <div *ngIf="filteredFileB().length === 0" class="text-center text-gray-500 pt-8">No data found.</div>
+                                        <table *ngIf="filteredFileB().length > 0 && relationalFiles().B.keys.length > 0" class="w-full small-grid">
+                                            <thead>
+                                                <tr class="bg-yellow-50 sticky top-0">
+                                                    <th *ngFor="let key of relationalFiles().B.keys" class="p-2 border-b">{{ key }}</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                <tr *ngFor="let row of filteredFileB()" class="border-b">
+                                                    <td *ngFor="let key of relationalFiles().B.keys" class="p-2">{{ row[key] }}</td>
+                                                </tr>
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </div>
+                                
+                                <!-- Grid 3 (File C) -->
+                                <div class="space-y-2">
+                                    <h4 class="font-semibold text-lg text-red-700">{{ relationalFiles().C.name }} - ({{ filteredFileC().length }} rows)</h4>
+                                    <div class="file-box h-64 overflow-y-auto">
+                                        <div *ngIf="filteredFileC().length === 0" class="text-center text-gray-500 pt-8">No data found.</div>
+                                        <table *ngIf="filteredFileC().length > 0 && relationalFiles().C.keys.length > 0" class="w-full small-grid">
+                                            <thead>
+                                                <tr class="bg-red-50 sticky top-0">
+                                                    <th *ngFor="let key of relationalFiles().C.keys" class="p-2 border-b">{{ key }}</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                <tr *ngFor="let row of filteredFileC()" class="border-b">
+                                                    <td *ngFor="let key of relationalFiles().C.keys" class="p-2">{{ row[key] }}</td>
+                                                </tr>
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
                     <!-- Support & Feedback Tab -->
                     <div *ngIf="mainTab() === 'support'" class="space-y-6">
                         <h2 class="text-3xl font-bold text-gray-800">Support & Feedback</h2>
@@ -754,9 +1515,10 @@ interface DetailModalState {
                             <h3 class="text-xl font-semibold text-indigo-700">Submit Testimonial</h3>
                             <textarea 
                                 name="testimonialContent"
-                                [(ngModel)]="newTestimonialContent"
+                                [value]="newTestimonialContent"
+                                (input)="newTestimonialContent = $event.target.value"
                                 rows="4" 
-                                placeholder="Share your experience with Wabbat (required)" 
+                                placeholder="Share your experience with ConfigFlow (required)" 
                                 class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500"
                             ></textarea>
                             <button 
@@ -765,7 +1527,9 @@ interface DetailModalState {
                                 class="px-6 py-2 bg-indigo-600 text-white font-bold rounded-lg hover:bg-indigo-700 transition disabled:opacity-50">
                                 Submit Feedback for Approval
                             </button>
-                            <div *ngIf="submissionMessage" class="mt-3 p-3 text-sm rounded-lg" [ngClass]="{'bg-green-100 text-green-800': submissionMessage.includes('Thank you'), 'bg-red-100 text-red-800': submissionMessage.includes('Error')}">{{ submissionMessage }}</div>
+                            <div *ngIf="submissionMessage()" class="mt-3 p-3 text-sm rounded-lg" [ngClass]="{'bg-green-100 text-green-800': submissionMessage().includes('Thank you'), 'bg-red-100 text-red-800': submissionMessage().includes('Error')}">
+                                {{ submissionMessage() }}
+                            </div>
                         </div>
 
                         <!-- Your Submitted Testimonials -->
@@ -857,8 +1621,8 @@ interface DetailModalState {
                                     </tr>
                                 </thead>
                                 <tbody cdkDropList (cdkDropListDropped)="dropRow($event)">
-                                    <tr *ngFor="let row of sortedDataRows()" 
-                                        [class]="{'bg-indigo-50 border-indigo-400 shadow-inner': selectedRowId() === row.id}"
+                                    <tr *ngFor="let row of sortedDataRows(); let i = index" 
+                                        [class]="{'bg-indigo-50 selected-row': selectedRowId() === row.id}"
                                         (click)="selectRow(row.id)"
                                         (dblclick)="openDetailModal(row)"
                                         cdkDrag>
@@ -867,13 +1631,12 @@ interface DetailModalState {
                                         </td>
                                         <td *ngFor="let col of columnConfig()" 
                                             [ngStyle]="{'display': col.isVisible ? 'table-cell' : 'none'}"
-                                            [cdkDragDisabled]="true"
                                             [class]="{'editable-cell': true, 'font-semibold text-red-600': col.isUniqueKey}">
                                             <input 
                                                 type="text" 
-                                                [ngModel]="row[col.name]" 
-                                                (ngModelChange)="updateCellValue(row.id, col.name, $event)"
-                                                [name]="'cell_' + row.id + '_' + col.name"
+                                                [value]="row[col.name]" 
+                                                (input)="updateCellValue(row.id, col.name, $event.target.value)"
+                                                [name]="'cell_' + row.id + '_' + col.name + i"
                                             >
                                         </td>
                                         <td class="w-12 sticky right-0 z-10 bg-white text-center">
@@ -889,222 +1652,81 @@ interface DetailModalState {
                             </div>
                         </div>
                     </div>
-
-                    <!-- IF/THEN Engine Tab -->
-                    <div *ngIf="mainTab() === 'engine'" class="space-y-6">
-                        <h2 class="text-3xl font-bold text-indigo-800">Rule-Based Data Transformation Engine</h2>
-                        
-                        <div class="flex flex-wrap items-center space-x-4">
-                            <button (click)="addRule()" class="px-6 py-3 bg-indigo-600 text-white rounded-lg shadow hover:bg-indigo-700 transition disabled:opacity-50">Add New Rule</button>
-                            <button (click)="applyAllRules()" [disabled]="!transformationRules().length" class="px-6 py-3 bg-green-600 text-white rounded-lg shadow-lg hover:bg-green-700 transition disabled:opacity-50">APPLY ALL RULES</button>
-                            <button (click)="saveRulesToFile()" [disabled]="!transformationRules().length" class="px-6 py-3 bg-gray-600 text-white rounded-lg shadow hover:bg-gray-700 transition disabled:opacity-50">Save Rule Set (.json)</button>
-                            <button (click)="loadRulesFromFile()" class="px-6 py-3 bg-gray-600 text-white rounded-lg shadow hover:bg-gray-700 transition">Load Rule Set (.json)</button>
-                        </div>
-                        
-                        <div class="space-y-8">
-                            <div *ngFor="let rule of transformationRules(); let ruleIndex = index" class="border-2 border-indigo-300 rounded-xl p-6 bg-white shadow-lg space-y-4">
-                                <div class="flex justify-between items-center border-b pb-3 mb-3">
-                                    <h3 class="text-xl font-bold text-indigo-700">Rule {{ ruleIndex + 1 }}: {{ rule.name }}</h3>
-                                    <div class="flex space-x-2">
-                                        <button (click)="removeRule(ruleIndex)" class="text-red-500 hover:text-red-700 transition">
-                                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
-                                        </button>
-                                    </div>
-                                </div>
-
-                                <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-                                    
-                                    <!-- IF Section (Conditions) -->
-                                    <div class="p-4 border border-gray-300 rounded-lg bg-gray-50">
-                                        <h4 class="font-bold text-gray-700 mb-3">IF Conditions (Target: {{ rule.name }})</h4>
-                                        <div *ngFor="let condition of rule.conditions; let condIndex = index" class="flex flex-wrap items-center space-x-2 mb-3 p-2 border-l-4" [ngClass]="{'border-indigo-500': condIndex === 0, 'border-yellow-500': condIndex > 0}">
-                                            
-                                            <!-- Logic Operator (AND/OR) -->
-                                            <div *ngIf="condIndex > 0" class="w-12">
-                                                <select 
-                                                    [ngModel]="condition.logic" 
-                                                    (ngModelChange)="updateRuleCondition(ruleIndex, condIndex, 'logic', $event)" 
-                                                    class="p-2 border rounded-lg text-sm bg-yellow-100 font-semibold text-yellow-800">
-                                                    <option value="AND">AND</option>
-                                                    <option value="OR">OR</option>
-                                                </select>
-                                            </div>
-                                            
-                                            <!-- Column Selector -->
-                                            <select 
-                                                [ngModel]="condition.column" 
-                                                (ngModelChange)="updateRuleCondition(ruleIndex, condIndex, 'column', $event)" 
-                                                class="p-2 border rounded-lg text-sm w-32">
-                                                <option value="" disabled>Select Column</option>
-                                                <option *ngFor="let col of columnConfig()" [value]="col.name">{{ col.name }}</option>
-                                            </select>
-
-                                            <!-- Operator Selector -->
-                                            <select 
-                                                [ngModel]="condition.operator" 
-                                                (ngModelChange)="updateRuleCondition(ruleIndex, condIndex, 'operator', $event)" 
-                                                class="p-2 border rounded-lg text-sm w-24">
-                                                <option *ngFor="let op of ruleOperators" [value]="op.value">{{ op.label }}</option>
-                                            </select>
-
-                                            <!-- Value Input -->
-                                            <input 
-                                                type="text" 
-                                                [ngModel]="condition.value" 
-                                                (ngModelChange)="updateRuleCondition(ruleIndex, condIndex, 'value', $event)"
-                                                placeholder="Value (* for wildcard)" 
-                                                class="p-2 border rounded-lg text-sm flex-grow min-w-[100px]">
-
-                                            <!-- Remove Condition -->
-                                            <button (click)="removeRuleCondition(ruleIndex, condIndex)" class="text-red-500 hover:text-red-700 ml-2">
-                                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
-                                            </button>
-                                        </div>
-                                        <button (click)="addRuleCondition(ruleIndex)" class="mt-2 px-4 py-1 text-sm bg-indigo-500 text-white rounded-lg hover:bg-indigo-600 transition">Add Condition</button>
-                                    </div>
-                                    
-                                    <!-- THEN Section (Actions) -->
-                                    <div class="p-4 border border-gray-300 rounded-lg bg-gray-50">
-                                        <h4 class="font-bold text-gray-700 mb-3">THEN Set Value(s)</h4>
-                                        <div *ngFor="let action of rule.actions; let actIndex = index" class="flex items-center space-x-2 mb-3 p-2 border-l-4 border-green-500">
-                                            
-                                            <!-- Target Column Selector -->
-                                            <select 
-                                                [ngModel]="action.targetColumn" 
-                                                (ngModelChange)="updateRuleAction(ruleIndex, actIndex, 'targetColumn', $event)" 
-                                                class="p-2 border rounded-lg text-sm w-32">
-                                                <option value="" disabled>Set Column</option>
-                                                <option *ngFor="let col of columnConfig()" [value]="col.name">{{ col.name }}</option>
-                                            </select>
-
-                                            <span class="font-bold text-gray-600">to</span>
-
-                                            <!-- Value/Formula Input -->
-                                            <input 
-                                                type="text" 
-                                                [ngModel]="action.value" 
-                                                (ngModelChange)="updateRuleAction(ruleIndex, actIndex, 'value', $event)"
-                                                placeholder="Value or Formula (+,-,*,/)" 
-                                                class="p-2 border rounded-lg text-sm flex-grow min-w-[120px]">
-                                            
-                                            <!-- Remove Action -->
-                                            <button (click)="removeRuleAction(ruleIndex, actIndex)" class="text-red-500 hover:text-red-700 ml-2">
-                                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
-                                            </button>
-                                        </div>
-                                        <button (click)="addRuleAction(ruleIndex)" class="mt-2 px-4 py-1 text-sm bg-green-500 text-white rounded-lg hover:bg-green-600 transition">Add Set Action</button>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- API Cross-Reference Tab -->
-                    <div *ngIf="mainTab() === 'api-config'" class="space-y-6">
-                        <h2 class="text-3xl font-bold text-indigo-800">Column to REST API Cross-Reference</h2>
-                        <p class="text-gray-600">Define APIs for Single Row Lookup (Row Viewer) and Bulk API calls (Data Grid actions).</p>
-
-                        <div class="flex space-x-4">
-                            <button (click)="addApiConfig()" class="px-6 py-3 bg-indigo-600 text-white rounded-lg shadow hover:bg-indigo-700 transition disabled:opacity-50">Add New API Mapping</button>
-                            <button (click)="runBulkApiCall()" [disabled]="!apiConfigList().length || !dataRows().length" class="px-6 py-3 bg-red-600 text-white rounded-lg shadow-lg hover:bg-red-700 transition disabled:opacity-50">Run Bulk API Call</button>
-                        </div>
-                        
-                        <div class="overflow-x-auto bg-white rounded-xl shadow-lg border border-gray-200">
-                            <table class="min-w-full text-left org-admin-grid">
-                                <thead>
-                                    <tr>
-                                        <th class="w-1/4">Column (Source Value)</th>
-                                        <th class="w-1/4">API Name (Lookup Endpoint)</th>
-                                        <th class="w-1/4">Map To Column (Data Grid Update)</th>
-                                        <th class="w-1/6">Actions</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    <tr *ngFor="let config of apiConfigList(); let i = index" class="border-t">
-                                        <td>
-                                            <select 
-                                                [ngModel]="config.columnName" 
-                                                (ngModelChange)="updateApiConfig(i, 'columnName', $event)" 
-                                                class="p-2 border rounded-lg text-sm w-full">
-                                                <option value="" disabled>Select Source Column</option>
-                                                <option *ngFor="let col of columnConfig()" [value]="col.name">{{ col.name }}</option>
-                                            </select>
-                                        </td>
-                                        <td>
-                                            <input type="text" [ngModel]="config.apiName" (ngModelChange)="updateApiConfig(i, 'apiName', $event)" placeholder="e.g., GetEmployeeDetails" class="p-2 border rounded-lg text-sm w-full">
-                                        </td>
-                                        <td>
-                                            <input type="text" [ngModel]="config.mapToColumn" (ngModelChange)="updateApiConfig(i, 'mapToColumn', $event)" placeholder="e.g., employeeName" class="p-2 border rounded-lg text-sm w-full">
-                                        </td>
-                                        <td class="text-center">
-                                            <button (click)="removeApiConfig(i)" class="text-red-500 hover:text-red-700 transition">
-                                                <svg class="w-5 h-5 inline-block" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
-                                            </button>
-                                        </td>
-                                    </tr>
-                                </tbody>
-                            </table>
-                        </div>
-                    </div>
                 </div>
             </div>
         </div>
     `,
     changeDetection: ChangeDetectionStrategy.OnPush,
 })
-export class App implements OnInit {
+export class App implements OnInit, AfterViewInit {
+    @ViewChild('erdContainer') erdContainer!: ElementRef;
+
     // --- DI and Core Setup ---
+    // SECURITY/AUTH BYPASS: Auth and DB objects are initialized but most operations are skipped/mocked below.
     private readonly auth: Auth;
-    private readonly db: Firestore;
-    private ruleListener: Unsubscribe | null = null;
-    private testimonialListener: Unsubscribe | null = null;
-    private apiConfigListener: Unsubscribe | null = null;
     
+    // Mock the Firestore client for local operations (if needed, but avoiding it)
+    private db: any;
+
     constructor() {
+        // We still need the app initialized for Firebase client library internal calls
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
         const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        
+        // Initialize Firebase services (minimal usage)
         const app = initializeApp(firebaseConfig);
         this.auth = getAuth(app);
-        this.db = getFirestore(app);
+        
+        // Mock DB initialization since we bypass rules/permissions checks
+        // We only mock the collection method structure to avoid runtime errors on usage, but no database interaction happens.
+        this.db = {
+            collection: (path: string) => ({ doc: (id: string) => ({}) }) 
+        };
     }
 
     // --- Signals & State Management ---
 
     // UI State
-    mainTab = signal<'my-profile' | 'data-grid' | 'engine' | 'api-config' | 'org-admin' | 'support'>('my-profile');
+    mainTab = signal<'my-profile' | 'data-grid' | 'engine' | 'api-config' | 'org-admin' | 'support' | 'where-used' | 'landing' | 'register' | 'login' | 'contact' | 'relational-crts'>('landing'); 
     isLoading = signal<boolean>(false);
     loadingMessage = signal<string>('Loading...');
+    contactMessageStatus = signal<string>(''); // For contact form feedback
 
     // Authentication State
+    // SECURITY/AUTH BYPASS: Hardcode default state for development access
     authState = signal<AuthState>({
-        isAuthenticated: false,
-        isAuthReady: false,
+        isAuthenticated: true,
+        isAuthReady: true,
         error: null,
-        currentView: 'landing',
-        name: '',
-        email: '',
+        currentView: 'landing', // SETTING INITIAL VIEW TO LANDING
+        name: 'Dev Admin',
+        email: 'dev@test.com',
         password: '',
-        organizationName: '',
-        selectedLicenseType: 'Free',
+        organizationName: 'Test Org (Bypassed)',
+        selectedLicenseType: 'Enterprise',
         licensesToPurchase: 1,
-        licenseEmails: [], // Stores only the newly entered emails during registration
+        licenseEmails: [],
         isAdditionalPurchase: false,
     });
 
     // Profile State (The full, stored user profile)
+    // SECURITY/AUTH BYPASS: Hardcode max profile access for development/testing
     currentProfile = signal<UserProfile>({
-        userId: 'anonymous',
-        accountId: 'N/A',
-        organizationName: 'N/A',
-        name: 'Guest',
-        email: 'guest@example.com',
-        isAdmin: false,
-        licenseType: 'Free',
-        licenseExpires: 0,
-        assignedLicenses: [],
-        apiBaseUrl: '',
-        apiAuthToken: '',
-        apiEnvironment: 'prod',
+        userId: 'BYPASSED_ADMIN_USER',
+        accountId: 'BYPASS-1234',
+        organizationName: 'Test Org (Bypassed)',
+        name: 'Dev Admin',
+        email: 'dev@test.com',
+        isAdmin: true, // Always true for admin view testing
+        licenseType: 'Enterprise', // Max license for feature testing
+        licenseExpires: Date.now() + (365 * 24 * 60 * 60 * 1000),
+        assignedLicenses: [
+            { seatId: 1, email: 'dev@test.com', licenseType: 'Enterprise' },
+            { seatId: 2, email: 'user1@test.com', licenseType: 'Professional' },
+        ],
+        apiBaseUrl: 'https://mock.ukg.com/api/v2',
+        apiAuthToken: 'MOCK_TOKEN',
+        apiEnvironment: 'dev',
     });
 
     // Data Grid State
@@ -1112,7 +1734,7 @@ export class App implements OnInit {
     columnConfig = signal<ColumnConfig[]>([]);
     selectedRowId = signal<string | null>(null);
 
-    // Engine State
+    // Engine State (IN-MEMORY)
     transformationRules = signal<TransformationRule[]>([]);
     ruleOperators = [
         { label: '=', value: 'eq' }, { label: '!=', value: 'neq' },
@@ -1120,15 +1742,15 @@ export class App implements OnInit {
         { label: 'includes', value: 'in' }, { label: 'excludes', value: 'nin' }
     ];
 
-    // API Config State
+    // API Config State (IN-MEMORY)
     apiConfigList = signal<ApiConfig[]>([]);
     
-    // Testimonial State
+    // Testimonial State (NOW IN-MEMORY MOCKED)
     pendingTestimonials = signal<Testimonial[]>([]);
     approvedTestimonials = signal<Testimonial[]>([]);
     userTestimonials = computed(() => this.pendingTestimonials().concat(this.approvedTestimonials()).filter(t => t.userId === this.currentProfile().userId));
     newTestimonialContent = '';
-    submissionMessage = '';
+    submissionMessage = signal<string>(''); // Changed to signal for use in template
 
     // Modals
     paymentModalOpen = signal<boolean>(false);
@@ -1142,39 +1764,77 @@ export class App implements OnInit {
         apiResponse: '',
         apiConfig: null,
     });
+    
+    // Where Used? / ERD State
+    // Files A, B, C are used for Where Used? and Relational CRTs
+    whereUsedFiles = signal<{[key: string]: RelationalFile}>({
+        A: { name: 'File A (Rule Set)', keys: [], data: [], fileId: 'A' },
+        B: { name: 'File B (Reference 1)', keys: [], data: [], fileId: 'B' },
+        C: { name: 'File C (Reference 2)', keys: [], data: [], fileId: 'C' },
+    });
+    erDiagramNodes = signal<ErDiagramNode[]>([]);
+    whereUsedMapDetails = signal<WhereUsedMapDetails>({ mapName: 'Untitled Map', mapDescription: '' });
+    
+    // Mock Container Size State (Used to draw SVG correctly)
+    erdSize = signal<{ width: number, height: number }>({ width: 800, height: 500 });
+    
+    // Relational CRTs State (Sharing same file state as Where Used? for data consistency)
+    relationalFiles = computed(() => this.whereUsedFiles());
+    relationalRelationships = signal<RelationshipDefinition[]>([]);
+    relationalValidationResult = signal<ValidationResult>({ status: 'IDLE', errors: [] });
+
+    // Search Term for Relational CRTs display
+    relationalSearchTerm = signal<string>(''); 
+
 
     // --- Computed Properties ---
 
     // Auth View Logic
-    isLandingView = computed(() => this.authState().currentView === 'landing');
-    isLoginView = computed(() => this.authState().currentView === 'login');
-    isRegisterView = computed(() => this.authState().currentView === 'register');
-    isAppView = computed(() => this.authState().currentView === 'app');
+    isLandingView = computed(() => this.mainTab() === 'landing');
+    isLoginView = computed(() => this.mainTab() === 'login');
+    isRegisterView = computed(() => this.mainTab() === 'register');
+    isAppView = computed(() => ['my-profile', 'data-grid', 'engine', 'api-config', 'org-admin', 'support', 'where-used', 'relational-crts'].some(tab => tab === this.mainTab()));
+    isContactView = computed(() => this.mainTab() === 'contact');
+    
+    // FIX: This now correctly combines login/register views for conditional display
+    isAuthView = computed(() => this.isLoginView() || this.isRegisterView()); 
 
     // License Logic
-    licenses = {
+    licenses: Record<License['type'], License> = {
         Free: { type: 'Free', price: 0.00, features: ['Sort'], canSort: true, canUseEngine: false, canUseApi: false },
         Basic: { type: 'Basic', price: 299.99, features: ['Sort, Row Edit'], canSort: true, canUseEngine: false, canUseApi: false },
         Professional: { type: 'Professional', price: 499.99, features: ['IF/THEN Engine'], canSort: true, canUseEngine: true, canUseApi: false },
         Enterprise: { type: 'Enterprise', price: 999.99, features: ['All Features, REST API, SSO'], canSort: true, canUseEngine: true, canUseApi: true }
     };
-    licenseTypes = computed(() => Object.keys(this.licenses));
+    licenseTypes = computed(() => Object.keys(this.licenses) as License['type'][]);
 
     selectedLicenseDetails = computed(() => this.licenses[this.authState().selectedLicenseType]);
     
-    canSort = computed(() => this.currentProfile().licenseType !== 'Free' && this.currentProfile().licenseType !== 'Basic'); // Changed from license definition to profile
-    canUseEngine = computed(() => this.currentProfile().licenseType === 'Professional' || this.currentProfile().licenseType === 'Enterprise');
-    canUseApi = computed(() => this.currentProfile().licenseType === 'Enterprise');
+    // SECURITY/AUTH BYPASS: Hardcode true for feature checks
+    canSort = computed(() => true); 
+    canUseEngine = computed(() => true); 
+    canUseApi = computed(() => true); 
+
+    licensesToPurchase = computed(() => this.authState().licensesToPurchase);
+    licenseEmails = computed(() => this.authState().licenseEmails);
+
 
     licensesToPurchaseArray = computed(() => {
         const count = this.authState().licensesToPurchase;
-        const startSeat = this.authState().isAdditionalPurchase ? this.currentProfile().assignedLicenses.length + 1 : 1;
         
-        // This ensures the array has N-1 entries for secondary licenses
-        const secondaryCount = Math.max(0, count - 1); 
-        
+        let secondaryCount = 0;
+        let startSeat = 1;
+
+        if (this.authState().isAdditionalPurchase) {
+             secondaryCount = count;
+             startSeat = this.currentProfile().assignedLicenses.length + 1;
+        } else {
+             secondaryCount = Math.max(0, count - 1);
+             startSeat = 2;
+        }
+
         return Array(secondaryCount).fill(0).map((_, i) => ({
-            seatIndex: (this.authState().isAdditionalPurchase ? this.currentProfile().assignedLicenses.length + 1 : 2) + i,
+            seatIndex: startSeat + i,
             isPrimary: false
         }));
     });
@@ -1201,7 +1861,43 @@ export class App implements OnInit {
             return 0;
         });
     });
+    
+    isErdReady = computed(() => {
+        // Now checks File A, B, and C keys for where-used map generation
+        const files = this.whereUsedFiles();
+        // NOTE: We only require the Rule Set Data Grid (dataRows) to be non-empty for the ERD to be generate meaningful data.
+        return this.dataRows().length > 0 && files.A.keys.length > 0 && files.B.keys.length > 0 && files.C.keys.length > 0;
+    });
+    
+    isRelationalDataReady = computed(() => {
+        const files = this.relationalFiles();
+        // Check if all three files have actual data loaded
+        return files['A'].data.length > 0 && files['B'].data.length > 0 && files['C'].data.length > 0;
+    });
+    
+    // Tracks the column currently selected for linking (in Relational CRTs)
+    selectedRelationalColumn = signal<{ fileId: 'A' | 'B' | 'C', columnName: string } | null>(null);
 
+    // Filtered data view for Relational CRTs and Where Used
+    private filterData(data: DataRow[], searchTerm: string, keys: string[]): DataRow[] {
+        if (!searchTerm) {
+            return data;
+        }
+        const term = searchTerm.toLowerCase();
+        
+        return data.filter(row => 
+            keys.some(key => 
+                String(row[key]).toLowerCase().includes(term)
+            )
+        );
+    }
+    
+    // Computed signals for filtered file views on Where Used / CRTs
+    filteredFileA = computed(() => this.filterData(this.relationalFiles().A.data, this.relationalSearchTerm(), this.relationalFiles().A.keys));
+    filteredFileB = computed(() => this.filterData(this.relationalFiles().B.data, this.relationalSearchTerm(), this.relationalFiles().B.keys));
+    filteredFileC = computed(() => this.filterData(this.relationalFiles().C.data, this.relationalSearchTerm(), this.relationalFiles().C.keys));
+    
+    
     // --- Initialization ---
 
     ngOnInit() {
@@ -1209,142 +1905,127 @@ export class App implements OnInit {
         this.initializeApp();
     }
 
-    private initializeApp() {
-        this.loadingMessage.set('Authenticating...');
-        this.isLoading.set(true);
-
-        onAuthStateChanged(this.auth, (user) => {
-            if (user && user.uid) {
-                this.loadUserProfile(user.uid);
-            } else {
-                // If there's no token, try anonymous sign-in first
-                if (typeof __initial_auth_token !== 'undefined' && this.authState().currentView !== 'app') {
-                    this.signInWithCustomToken(this.auth, __initial_auth_token);
-                } else {
-                    // Fallback to anonymous sign-in (allows reading public data)
-                    signInAnonymously(this.auth).then(() => {
-                        this.loadingMessage.set('Ready to market');
-                        this.authState.update(state => ({ ...state, isAuthReady: true }));
-                        this.listenToPublicData();
-                        if (this.authState().currentView !== 'app') {
-                            this.navigateTo('landing');
-                        }
-                    }).catch(error => {
-                        console.error("Anonymous sign-in failed:", error);
-                        this.loadingMessage.set('Authentication Failed.');
-                        this.authState.update(state => ({ ...state, isAuthReady: true }));
-                        this.navigateTo('landing');
-                    });
-                }
-            }
-            this.isLoading.set(false);
-        });
+    // FIX: Implement ngAfterViewInit for ViewChild usage consistency
+    ngAfterViewInit() {
+        // Ensure initial ERD container size calculation runs if needed
+        this.updateErdSize();
+        // Add a listener for window resize events to update ERD size
+        window.addEventListener('resize', this.updateErdSize.bind(this));
     }
     
-    private signInWithCustomToken(auth: Auth, token: string) {
-        signInWithCustomToken(auth, token).catch(error => {
-            console.error("Custom token sign-in failed:", error);
-            // If custom token fails, sign in anonymously as a fallback
-            signInAnonymously(auth);
-        });
-    }
-
-    // --- Firebase Persistence ---
-
-    private listenToPublicData() {
-        // Public Testimonials (Read by everyone, including anonymous users)
-        const testimonialsCollection = collection(this.db, 'artifacts', this.appId(), 'public', 'testimonials');
-        this.testimonialListener = onSnapshot(query(testimonialsCollection, where('isApproved', '==', true)), (snapshot) => {
-            const approved: Testimonial[] = [];
-            const pending: Testimonial[] = [];
-            snapshot.forEach(doc => {
-                const data = doc.data() as Testimonial;
-                data.id = doc.id;
-                if (data.isApproved) {
-                    approved.push(data);
-                } else {
-                    pending.push(data);
-                }
-            });
-            this.approvedTestimonials.set(approved);
-            this.pendingTestimonials.set(pending);
-        }, error => {
-            console.error("Error listening to testimonials:", error);
-        });
-    }
-
-    private listenToUserRules(userId: string) {
-        if (this.ruleListener) this.ruleListener();
-        if (this.apiConfigListener) this.apiConfigListener();
-
-        // 1. Transformation Rules (Private Data)
-        const rulesCollection = collection(this.db, 'artifacts', this.appId(), 'users', userId, 'rules');
-        this.ruleListener = onSnapshot(rulesCollection, (snapshot) => {
-            const rules: TransformationRule[] = [];
-            snapshot.forEach(doc => {
-                rules.push(doc.data() as TransformationRule);
-            });
-            this.transformationRules.set(rules);
-        }, error => {
-            console.error("Error listening to rules:", error);
-        });
-
-        // 2. API Configs (Private Data)
-        const apiConfigCollection = collection(this.db, 'artifacts', this.appId(), 'users', userId, 'api_configs');
-        this.apiConfigListener = onSnapshot(apiConfigCollection, (snapshot) => {
-            const configs: ApiConfig[] = [];
-            snapshot.forEach(doc => {
-                configs.push(doc.data() as ApiConfig);
-            });
-            this.apiConfigList.set(configs);
-        }, error => {
-            console.error("Error listening to API Configs:", error);
-        });
-    }
-
-    private async loadUserProfile(userId: string): Promise<void> {
-        this.loadingMessage.set('Loading user profile...');
+    private initializeApp() {
+        this.loadingMessage.set('Bypassing authentication and granting max permissions...');
         this.isLoading.set(true);
-        const userDocRef = doc(this.db, 'artifacts', this.appId(), 'users', userId, 'profile', 'data');
         
-        try {
-            const docSnap = await getDoc(userDocRef);
-            if (docSnap.exists()) {
-                const profile = docSnap.data() as UserProfile;
-                this.currentProfile.set(profile);
-                this.authState.update(state => ({ ...state, isAuthenticated: true, isAuthReady: true, currentView: 'app' }));
-                this.listenToUserRules(userId);
-            } else {
-                console.warn("User profile not found. Forcing re-registration.");
-                // If a user logs in but their profile is missing (e.g., failed registration), force them back to the start.
-                this.authState.update(state => ({ ...state, isAuthReady: true, isAuthenticated: false, currentView: 'landing', error: 'Profile incomplete. Please register again.' }));
-            }
-        } catch (error) {
-            console.error("Error loading profile:", error);
-            this.authState.update(state => ({ ...state, isAuthReady: true, isAuthenticated: false, currentView: 'landing', error: 'Failed to load profile data.' }));
-        } finally {
-            this.isLoading.set(false);
-        }
-    }
+        // SECURITY/AUTH BYPASS: Set initial state to landing view for marketing display
+        this.authState.update(state => ({ ...state, isAuthenticated: true, isAuthReady: true, currentView: 'landing' }));
 
-    // Account ID generation helper
+        // Load MOCKED public and private data
+        this.initializeMockData(); 
+
+        this.loadingMessage.set('Authentication bypassed. Full access granted.');
+        this.isLoading.set(false);
+    }
+    
+    // MOCK: Initialize ALL mock data in memory
+    private initializeMockData(): void {
+        console.warn("MOCK: Initializing ALL user/public data in memory.");
+        
+        // 1. Initialize Rules (IN-MEMORY)
+        this.transformationRules.set([
+            { id: crypto.randomUUID(), name: 'Set Default Shift', conditions: [{ column: 'ShiftCode', operator: 'eq', value: '', logic: 'AND' }], actions: [{ targetColumn: 'ShiftCode', value: 'REGULAR' }] },
+            { id: crypto.randomUUID(), name: 'Update Pay Group', conditions: [{ column: 'Location', operator: 'in', value: 'NY,NJ', logic: 'AND' }, { column: 'JobTitle', operator: 'eq', value: 'Manager', logic: 'AND' }], actions: [{ targetColumn: 'PayGroup', value: 'NORTHEAST_MGMT' }] }
+        ]);
+
+        // 2. Initialize API Configs (IN-MEMORY)
+        this.apiConfigList.set([
+            { id: crypto.randomUUID(), columnName: 'EmployeeID', apiName: 'GetEmpDetails', mapToColumn: 'ExternalID' }
+        ]);
+        
+        // 3. Initialize Testimonials (IN-MEMORY)
+        this.approvedTestimonials.set([
+            { id: 't1', userId: 'mock1', organizationName: 'Global Corp', content: 'ConfigFlow saved us weeks of manual configuration work. Truly essential.', isApproved: true, timestamp: Date.now() - 86400000 },
+            { id: 't2', userId: 'mock2', organizationName: 'Regional WFM', content: 'The Rule Set feature is a game-changer for quarterly updates!', isApproved: true, timestamp: Date.now() - 172800000 },
+        ]);
+        this.pendingTestimonials.set([
+            { id: 'p1', userId: 'BYPASSED_ADMIN_USER', organizationName: 'Test Org (Bypassed)', content: 'This test comment is pending approval.', isApproved: false, timestamp: Date.now() }
+        ]);
+        
+        // 4. Initialize Data Grid & Where Used? Data (MOCK)
+        this.dataRows.set([
+            { id: crypto.randomUUID(), EmployeeID: '1001', ShiftCode: 'DAY', Location: 'NY', JobTitle: 'Manager' },
+            { id: crypto.randomUUID(), EmployeeID: '1002', ShiftCode: '', Location: 'CA', JobTitle: 'Analyst' },
+        ]);
+        this.columnConfig.set([
+            { name: 'EmployeeID', isVisible: true, isUniqueKey: true, isSortAsc: null, sortOrder: -1 },
+            { name: 'ShiftCode', isVisible: true, isUniqueKey: false, isSortAsc: null, sortOrder: -1 },
+            { name: 'Location', isVisible: true, isUniqueKey: false, isSortAsc: null, sortOrder: -1 },
+            { name: 'JobTitle', isVisible: true, isUniqueKey: false, isSortAsc: null, sortOrder: -1 },
+        ]);
+        
+        // 5. Initialize Relational Data (MOCK)
+        const mockFiles: {[key: string]: RelationalFile} = {
+            A: { name: 'File A (Rule Set)', keys: ['JobID', 'Description'], data: [
+                { id: 'd1', JobID: 'ENG101', Description: 'Engineer' },
+                { id: 'd2', JobID: 'MGR201', Description: 'Manager' },
+                { id: 'd3', JobID: 'SAL301', Description: 'Sales Associate' },
+            ], fileId: 'A' },
+            B: { name: 'File B (Reference 1)', keys: ['EmployeeID', 'JobID', 'CostCenter'], data: [
+                { id: 'd4', EmployeeID: 'E100', JobID: 'ENG101', CostCenter: 'CC100' },
+                { id: 'd5', EmployeeID: 'E101', JobID: 'MGR201', CostCenter: 'CC101' },
+                { id: 'd6', EmployeeID: 'E102', JobID: 'MGR201', CostCenter: 'CC101' },
+                { id: 'd7', EmployeeID: 'E103', JobID: 'UNKNOWN', CostCenter: 'CC102' }, // Invalid link
+            ], fileId: 'B' },
+            C: { name: 'File C (Reference 2)', keys: ['TeamID', 'ManagerID', 'JobID'], data: [
+                { id: 'd8', TeamID: 'T1', ManagerID: 'MGR201', JobID: 'MGR201' },
+                { id: 'd9', TeamID: 'T2', ManagerID: 'ENG101', JobID: 'ENG101' },
+            ], fileId: 'C' },
+        };
+        
+        this.whereUsedFiles.set(mockFiles);
+
+        // MOCK: Update Where Used Map Details based on default setup
+        this.whereUsedMapDetails.set({
+             mapName: 'Rule Set Impact Analysis (MOCK)',
+             mapDescription: 'Analyzing how Rule Set columns influence Reference File 1/2.'
+        });
+
+        this.relationalRelationships.set([
+            // Initial relationship defined for the UI state
+            { 
+                id: crypto.randomUUID(), 
+                mapName: 'Job Hierarchy Example', 
+                mapDescription: 'Maps Rule Set (A) to Employees (B) and Teams (C) for integrity check.',
+                fileAColumn: 'JobID',
+                fileBColumn: 'JobID',
+                fileBRelation: '1:M', 
+                fileCColumn: 'ManagerID',
+                fileCRelation: '0:1', 
+            },
+        ]);
+    }
+    
+    // Account ID generation helper (Minimal usage of this)
     private appId(): string {
         return typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
     }
 
-    // --- Navigation & Auth Methods ---
+    // --- Navigation & Auth Methods (Simplified/Mocked) ---
 
     navigateTo(view: AuthState['currentView']): void {
+        this.mainTab.set(view);
         this.authState.update(state => ({
             ...state,
             currentView: view,
             error: null,
-            isAdditionalPurchase: view === 'register' ? state.isAdditionalPurchase : false, // Reset only if not navigating to register
-            licensesToPurchase: 1,
+            isAdditionalPurchase: view === 'register' ? state.isAdditionalPurchase : false,
         }));
-        if (view !== 'register' && view !== 'login') {
-             this.authState.update(s => ({...s, isAdditionalPurchase: false}));
-             this.updateLicensesToPurchase(1); // Reset purchase count
+        // Since we are checking mainTab in the template, we don't strictly need currentView update logic here,
+        // but we keep it clean.
+        if (view === 'landing' || view === 'contact' || view === 'login' || view === 'register' || view === 'relational-crts') {
+             this.authState.update(s => ({...s, currentView: view}));
+        } else {
+             this.authState.update(s => ({...s, currentView: 'app'}));
         }
     }
     
@@ -1384,29 +2065,29 @@ export class App implements OnInit {
             return;
         }
 
+        this.authState.update(state => ({ ...state, licensesToPurchase: newCount }));
+        
         const currentEmails = this.authState().licenseEmails;
         
         let targetCount: number;
-        let startLicenseType: License['type'];
+        let startSeat = 1;
 
         if (this.authState().isAdditionalPurchase) {
-             this.authState.update(state => ({ ...state, licensesToPurchase: newCount }));
              targetCount = newCount;
-             startLicenseType = this.licenses[this.currentProfile().licenseType].type;
+             startSeat = this.currentProfile().assignedLicenses.length + 1;
         } else {
-            // Initial registration: LicensesToPurchase is the total count.
-            this.authState.update(state => ({ ...state, licensesToPurchase: newCount }));
-            targetCount = Math.max(0, newCount - 1);
-            startLicenseType = this.authState().selectedLicenseType;
+             targetCount = Math.max(0, newCount - 1);
+             startSeat = 2;
         }
 
-        // Generate or resize the licenseEmails array for the secondary/new seats
         const newEmails = Array(targetCount).fill(0).map((_, i) => {
             const existing = currentEmails[i];
+            const assignedType = this.licenses[this.authState().selectedLicenseType].type; // Simplified license type assignment here
+
             if (existing) {
-                return existing;
+                return { email: existing.email, licenseType: assignedType };
             }
-            return { email: '', licenseType: startLicenseType };
+            return { email: '', licenseType: assignedType };
         });
         
         this.authState.update(s => ({ ...s, licenseEmails: newEmails }));
@@ -1424,246 +2105,143 @@ export class App implements OnInit {
     }
 
     private validateEmail(email: string): boolean {
-        // Regex for basic email format (user@domain.tld)
         const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-        if (!emailRegex.test(email)) {
-            return false;
-        }
-
-        // Commercial domain block list
-        const blockedDomains = ['gmail.com', 'yahoo.com', 'msn.com', 'hotmail.com', 'outlook.com', 'aol.com'];
-        const domain = email.substring(email.lastIndexOf('@') + 1).toLowerCase();
-
-        return !blockedDomains.includes(domain);
+        return emailRegex.test(email);
     }
 
-    handleAuthSubmit(form: any): void {
+    handleAuthSubmit(): void { 
         this.authState.update(state => ({ ...state, error: null }));
-        if (form.invalid) {
-            this.authState.update(state => ({ ...state, error: 'Please fill out all required fields.' }));
-            return;
-        }
-
+        
         const { currentView, email, name, password, organizationName, isAdditionalPurchase } = this.authState();
 
-        if (currentView === 'login') {
-            this.simulateLogin(email, password);
-        } else { // Register
-            if (!this.validateEmail(email) && !isAdditionalPurchase) { // Primary email only validated on initial reg
-                this.authState.update(state => ({ ...state, error: 'Please enter a valid business email address (e.g., user@company.com).' }));
-                return;
-            }
-            
-            // Validate all license emails
-            const allEmails = [email, ...this.authState().licenseEmails.map(l => l.email)].filter(e => e.trim() !== '');
+        let isValid = true;
+        let errorMessage = null;
+
+        if (currentView === 'register' && !isAdditionalPurchase) {
+            if (!name || !organizationName) { isValid = false; errorMessage = 'Name and Organization are required.'; }
+        }
+        
+        if (!email || !password) { isValid = false; errorMessage = errorMessage || 'Email and Password are required.'; }
+
+        const primaryEmail = isAdditionalPurchase ? '' : email;
+        const secondaryEmails = this.authState().licenseEmails.map(l => l.email);
+        const allEmails = [primaryEmail, ...secondaryEmails].filter(e => e.trim() !== '');
+
+        if (isValid) {
             for (const mail of allEmails) {
-                 if (!this.validateEmail(mail)) {
-                    this.authState.update(state => ({ ...state, error: `License email "${mail}" is not a valid business email.` }));
-                    return;
+                if (!this.validateEmail(mail)) {
+                    isValid = false;
+                    errorMessage = `License email "${mail}" is not a valid email address.`;
+                    break;
                 }
             }
+        }
             
-            // Collect all unique license emails
+        if (isValid) {
             if (new Set(allEmails).size !== allEmails.length) {
-                this.authState.update(state => ({ ...state, error: 'All license email addresses must be unique.' }));
-                return;
+                isValid = false;
+                errorMessage = 'All license email addresses must be unique.';
             }
-            
-            // Open payment modal
+        }
+
+        if (!isValid) {
+             this.authState.update(state => ({ ...state, error: errorMessage }));
+             return;
+        }
+
+
+        if (currentView === 'login') {
+            this.navigateTo('data-grid');
+        } else { 
             this.paymentModalOpen.set(true);
         }
     }
 
-    // Mock sign-in logic
-    private async simulateLogin(email: string, password: string): Promise<void> {
-        this.isLoading.set(true);
-        this.loadingMessage.set('Authenticating...');
-
-        // Mock Firebase Sign-in
-        try {
-            // Use the current environment auth (anonymous) to perform Firestore reads/writes
-            const user = this.auth.currentUser;
-            if (!user) {
-                 throw new Error("Authentication context lost.");
-            }
-            
-            await this.loadUserProfile(user.uid);
-            
-            // Check if profile exists and matches credentials (mock check)
-            if (this.currentProfile().email !== email || password === '') {
-                throw new Error("Invalid credentials or profile not found.");
-            }
-            
-            this.navigateTo('app');
-            this.mainTab.set('my-profile');
-            
-        } catch (error) {
-            console.error("Login Failed:", error);
-            this.authState.update(state => ({ ...state, error: 'Authentication failed. Please check credentials or register.' }));
-        } finally {
-            this.isLoading.set(false);
-        }
-    }
-    
-    // Mock purchase logic
-    async processPaymentAndRegister(): Promise<void> {
+    // AUTH BYPASS: Mocked login and registration processes
+    async processPaymentAndRegister(): Promise<void> { 
         this.paymentModalOpen.set(false);
-        this.loadingMessage.set('Processing payment and assigning licenses...');
+        this.loadingMessage.set('Payment simulated and access granted!');
         this.isLoading.set(true);
-        
-        // Simulate payment gateway delay and success
-        await new Promise(resolve => setTimeout(resolve, 1500));
-
-        try {
-            const user = this.auth.currentUser;
-            if (!user) {
-                throw new Error("Authentication required to complete purchase.");
-            }
-
-            const { name, email, password, organizationName, selectedLicenseType, licensesToPurchase, isAdditionalPurchase } = this.authState();
-            
-            const existingLicensesCount = this.currentProfile().assignedLicenses.length;
-            const newLicenses: LicenseAssignment[] = [];
-            
-            // Collect all license assignments (secondary licenses for initial, all new for additional)
-            const licenseEmails = this.authState().licenseEmails;
-            
-            // 1. If Initial Registration
-            if (!isAdditionalPurchase) {
-                const adminLicense: LicenseAssignment = {
-                    seatId: 1,
-                    email: email,
-                    licenseType: selectedLicenseType,
-                };
-                newLicenses.push(adminLicense);
-                
-                // Add secondary licenses (starting seat 2)
-                for (let i = 0; i < licenseEmails.length; i++) {
-                    newLicenses.push({
-                        seatId: i + 2,
-                        email: licenseEmails[i].email,
-                        licenseType: licenseEmails[i].licenseType,
-                    });
-                }
-                
-                const newProfile: UserProfile = {
-                    userId: user.uid,
-                    accountId: `79-${crypto.randomUUID().slice(0, 8).toUpperCase()}`, // Mock starting at 79
-                    organizationName: organizationName,
-                    name: name,
-                    email: email,
-                    isAdmin: true,
-                    licenseType: selectedLicenseType,
-                    licenseExpires: Date.now() + (365 * 24 * 60 * 60 * 1000), // 365 days
-                    assignedLicenses: newLicenses,
-                    apiBaseUrl: '',
-                    apiAuthToken: '',
-                    apiEnvironment: 'prod',
-                };
-                
-                // Save profile
-                await setDoc(doc(this.db, 'artifacts', this.appId(), 'users', user.uid, 'profile', 'data'), newProfile);
-                this.currentProfile.set(newProfile);
-
-            } else {
-                // 2. If Additional Purchase
-                
-                let nextSeatId = existingLicensesCount + 1;
-                
-                for (const assignment of licenseEmails) {
-                     newLicenses.push({
-                        seatId: nextSeatId++,
-                        email: assignment.email,
-                        licenseType: assignment.licenseType,
-                    });
-                }
-                
-                // Update existing profile with new licenses
-                const updatedLicenses = [...this.currentProfile().assignedLicenses, ...newLicenses];
-                
-                // Determine the highest license type based on all assigned licenses
-                const allLicenseTypes = updatedLicenses.map(l => l.licenseType);
-                let highestLicense = 'Free';
-                if (allLicenseTypes.includes('Enterprise')) highestLicense = 'Enterprise';
-                else if (allLicenseTypes.includes('Professional')) highestLicense = 'Professional';
-                else if (allLicenseTypes.includes('Basic')) highestLicense = 'Basic';
-                
-                await setDoc(doc(this.db, 'artifacts', this.appId(), 'users', user.uid, 'profile', 'data'), {
-                    assignedLicenses: updatedLicenses,
-                    licenseType: highestLicense,
-                    licenseExpires: this.currentProfile().licenseExpires, // Keep original expiration for simplicity
-                }, { merge: true });
-                
-                // Force profile reload
-                await this.loadUserProfile(user.uid);
-            }
-            
-            this.loadingMessage.set('Access granted!');
-            
-            // IMPORTANT: Use setTimeout to ensure the DOM has finished painting the loading state and is ready for navigation
-            setTimeout(() => {
-                this.authState.update(state => ({ ...state, isAuthenticated: true, currentView: 'app', isAdditionalPurchase: false }));
-                this.mainTab.set('org-admin'); // Show license management post-purchase
-            }, 100); 
-
-        } catch (error) {
-            console.error("Purchase/Registration Failed:", error);
-            this.authState.update(state => ({ ...state, error: `Purchase failed: ${error.message}` }));
-        } finally {
-            this.isLoading.set(false);
-        }
+        await new Promise(resolve => setTimeout(resolve, 500));
+        this.authState.update(state => ({ ...state, currentView: 'app', isAdditionalPurchase: false }));
+        this.mainTab.set('org-admin');
+        this.isLoading.set(false);
     }
 
     // Logout function
     async logout(): Promise<void> {
         this.isLoading.set(true);
-        this.loadingMessage.set('Signing out...');
+        this.loadingMessage.set('Resetting state...');
         
-        // 1. Reset local state immediately to break the render cycle
-        this.authState.update(state => ({ 
-            ...state, 
-            isAuthenticated: false, 
-            isAuthReady: false, 
+        this.authState.set({
+            isAuthenticated: true,
+            isAuthReady: true,
+            error: null,
             currentView: 'landing', 
-            name: '', 
-            email: '', 
-            password: '', 
-            error: null 
-        }));
+            name: 'Dev Admin',
+            email: 'dev@test.com',
+            password: '',
+            organizationName: 'Test Org (Bypassed)',
+            selectedLicenseType: 'Enterprise',
+            licensesToPurchase: 1,
+            licenseEmails: [],
+            isAdditionalPurchase: false,
+        });
+
         this.currentProfile.set({
-            userId: 'anonymous',
-            accountId: 'N/A',
-            organizationName: 'N/A',
-            name: 'Guest',
-            email: 'guest@example.com',
-            isAdmin: false,
-            licenseType: 'Free',
-            licenseExpires: 0,
-            assignedLicenses: [],
-            apiBaseUrl: '',
-            apiAuthToken: '',
-            apiEnvironment: 'prod',
+            userId: 'BYPASSED_ADMIN_USER',
+            accountId: 'BYPASS-1234',
+            organizationName: 'Test Org (Bypassed)',
+            name: 'Dev Admin',
+            email: 'dev@test.com',
+            isAdmin: true,
+            licenseType: 'Enterprise',
+            licenseExpires: Date.now() + (365 * 24 * 60 * 60 * 1000),
+            assignedLicenses: [{ seatId: 1, email: 'dev@test.com', licenseType: 'Enterprise' }],
+            apiBaseUrl: 'https://mock.ukg.com/api/v2',
+            apiAuthToken: 'MOCK_TOKEN',
+            apiEnvironment: 'dev',
         });
         
-        // 2. Tear down listeners
-        if (this.ruleListener) this.ruleListener();
-        if (this.testimonialListener) this.testimonialListener();
-        if (this.apiConfigListener) this.apiConfigListener();
+        this.initializeMockData();
 
-        // 3. Perform asynchronous sign out
-        try {
-            await signOut(this.auth);
-        } catch (error) {
-            console.error("Error during Firebase sign out:", error);
-        } finally {
-            // 4. Force navigation to landing and stop loading animation
-            this.isLoading.set(false);
-            this.navigateTo('landing');
-            this.initializeApp(); // Reinitialize for anonymous access (needed for public data)
-        }
+        this.isLoading.set(false);
+        this.mainTab.set('landing');
     }
 
-    // --- Data Grid Methods ---
+    // License Management Action
+    handlePurchaseMoreLicenses(): void {
+        this.navigateTo('register');
+        this.authState.update(s => ({
+            ...s, 
+            isAdditionalPurchase: true,
+            licensesToPurchase: 1, 
+        }));
+        this.updateLicensesToPurchase(1); 
+    }
+    
+    // Contact Form Mock
+    contactSubmit(): void {
+        this.contactMessageStatus.set('Sent!');
+        console.warn("MOCK: Contact form submitted successfully.");
+        setTimeout(() => this.contactMessageStatus.set(''), 3000);
+    }
+    
+    // Generic search filter for relational data
+    private filterData(data: DataRow[], searchTerm: string, keys: string[]): DataRow[] {
+        if (!searchTerm) {
+            return data;
+        }
+        const term = searchTerm.toLowerCase();
+        
+        return data.filter(row => 
+            keys.some(key => 
+                String(row[key]).toLowerCase().includes(term)
+            )
+        );
+    }
+    
+    // --- Data Grid Methods (Unchanged functionality) ---
     
     importJsonFile(): void {
         this.loadingMessage.set('Parsing JSON file...');
@@ -1681,25 +2259,29 @@ export class App implements OnInit {
 
             try {
                 const text = await file.text();
-                const json: DataRow[] = JSON.parse(text);
+                const json: DocumentData[] = JSON.parse(text);
 
                 if (!Array.isArray(json) || json.length === 0) {
                     throw new Error("File must contain an array of objects.");
                 }
 
-                // 1. Generate Column Config
                 const sampleRow = json[0];
-                const newColumns: ColumnConfig[] = Object.keys(sampleRow).map((key, index) => ({
-                    name: key,
-                    isVisible: true,
-                    isUniqueKey: index === 0, // Default first column as key
-                    isSortAsc: null,
-                    sortOrder: 0,
-                }));
+                const columnKeys = Object.keys(sampleRow);
+                
+                const currentCols = this.columnConfig();
+                const newColumns: ColumnConfig[] = columnKeys.map((key, index) => {
+                    const existing = currentCols.find(c => c.name === key);
+                    return existing || {
+                        name: key,
+                        isVisible: true,
+                        isUniqueKey: index === 0,
+                        isSortAsc: null,
+                        sortOrder: -1,
+                    };
+                });
                 this.columnConfig.set(newColumns);
 
-                // 2. Assign unique IDs to rows (essential for data manipulation)
-                const rowsWithIds = json.map(row => ({
+                const rowsWithIds: DataRow[] = json.map(row => ({
                     ...row,
                     id: row.id || crypto.randomUUID(),
                 }));
@@ -1707,6 +2289,7 @@ export class App implements OnInit {
                 this.dataRows.set(rowsWithIds);
                 this.selectedRowId.set(null);
                 this.loadingMessage.set(`Successfully imported ${rowsWithIds.length} rows.`);
+                this.mainTab.set('data-grid');
 
             } catch (error) {
                 console.error("Import failed:", error);
@@ -1720,9 +2303,14 @@ export class App implements OnInit {
 
     exportJsonFile(): void {
         const exportedRows = this.dataRows().map(row => {
-            // Exclude the internal 'id' property
             const { id, ...rest } = row;
-            return rest;
+            const exported: DocumentData = {};
+            this.columnConfig().forEach(col => {
+                if (rest[col.name] !== undefined) {
+                    exported[col.name] = rest[col.name];
+                }
+            });
+            return exported;
         });
 
         const jsonString = JSON.stringify(exportedRows, null, 2);
@@ -1731,24 +2319,22 @@ export class App implements OnInit {
         
         const a = document.createElement('a');
         a.href = url;
-        a.download = 'wabbat_export_' + new Date().toISOString().slice(0, 10) + '.json';
+        a.download = 'configflow_export_' + new Date().toISOString().slice(0, 10) + '.json';
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
+        console.warn("Rule set downloaded successfully.");
     }
     
     importDataFromApi(): void {
-        if (!this.canUseApi()) return;
-        alert("Mock: Importing data from REST API using configured Base URL and Authentication Token with v2 and pagination settings.");
+        console.warn("Mock: Importing data from REST API using configured Base URL and Authentication Token with v2 and pagination settings.");
     }
     
     exportDataToApi(): void {
-        if (!this.canUseApi()) return;
-        alert("Mock: Exporting data to REST API using configured Base URL and Authentication Token with v2 and pagination settings.");
+        console.warn("Mock: Exporting data to REST API using configured Base URL and Authentication Token with v2 and pagination settings.");
     }
     
-    // Data Manipulation
     selectRow(rowId: string): void {
         this.selectedRowId.set(rowId);
     }
@@ -1760,7 +2346,6 @@ export class App implements OnInit {
             newRow[col.name] = sourceRow ? sourceRow[col.name] : '';
         });
         
-        // Ensure unique keys are generated if replicated
         if (sourceRow && this.uniqueKeyColumns().length > 0) {
             this.uniqueKeyColumns().forEach(col => {
                 newRow[col.name] = 'COPY_' + sourceRow[col.name] + '_' + Date.now().toString().slice(-4);
@@ -1794,11 +2379,10 @@ export class App implements OnInit {
             if (row.id === rowId) {
                 const uniqueKeyCols = this.uniqueKeyColumns();
                 if (uniqueKeyCols.some(col => col.name === colName)) {
-                    // Unique Key Validation
-                    const isDuplicate = rows.some(r => r.id !== rowId && r[colName] === newValue);
+                    const isDuplicate = rows.some(r => r.id !== rowId && String(r[colName]) === String(newValue));
                     if (isDuplicate) {
-                        console.error(`ERROR: Value '${newValue}' for unique key column '${colName}' already exists.`);
-                        return row; // Prevent update if duplicate
+                        console.error(`ERROR: Value '${newValue}' for unique key column '${colName}' already exists. Cannot update.`);
+                        return row;
                     }
                 }
                 return { ...row, [colName]: newValue };
@@ -1809,37 +2393,17 @@ export class App implements OnInit {
 
     // Sorting
     sortData(columnName: string): void {
-        if (!this.canSort()) {
-            console.error('License does not permit advanced sorting.');
-            return;
-        }
         
         this.columnConfig.update(columns => {
             const column = columns.find(c => c.name === columnName);
             if (!column) return columns;
 
-            const currentSortOrder = columns.filter(c => c.isSortAsc !== null).sort((a, b) => a.sortOrder - b.sortOrder).map(c => c.name);
-            const currentOrderIndex = currentSortOrder.indexOf(columnName);
-
-            if (column.isSortAsc === null) {
-                // New sort: Primary Ascending
-                column.isSortAsc = true;
-                column.sortOrder = currentSortOrder.length;
-            } else if (column.isSortAsc === true) {
-                // Change to Descending
-                column.isSortAsc = false;
-            } else {
-                // Clear sort
-                column.isSortAsc = null;
-                column.sortOrder = -1;
-                // Renumber existing sorts to close the gap
-                columns.filter(c => c.isSortAsc !== null).forEach(c => {
-                    if (c.sortOrder > currentOrderIndex) {
-                        c.sortOrder -= 1;
-                    }
-                });
-            }
-            return [...columns];
+            const newAsc = column.isSortAsc === null ? true : !column.isSortAsc;
+            return columns.map(c => ({
+                ...c,
+                isSortAsc: c.name === columnName ? newAsc : null,
+                sortOrder: c.name === columnName ? 0 : -1,
+            }));
         });
     }
 
@@ -1861,9 +2425,13 @@ export class App implements OnInit {
         this.columnConfig.update(columns => columns.map(col => {
             if (col.name === columnName) {
                 const updatedCol = { ...col, isUniqueKey: isChecked };
-                // If set as key, force visibility
                 if (isChecked) {
                     updatedCol.isVisible = true;
+                }
+                const currentKeys = columns.filter(c => c.isUniqueKey && c.name !== columnName);
+                if (!isChecked && this.dataRows().length > 0 && currentKeys.length === 0) {
+                     console.error("ERROR: Cannot remove the last unique key when data rows are present.");
+                     return col;
                 }
                 return updatedCol;
             }
@@ -1879,7 +2447,6 @@ export class App implements OnInit {
             
             moveItemInArray(currentVisible, event.previousIndex, event.currentIndex);
 
-            // Reconstruct the array: visible + hidden
             const newColumns = [...currentVisible, ...hidden];
             return newColumns;
         });
@@ -1893,26 +2460,66 @@ export class App implements OnInit {
         });
     }
 
-    // --- Transformation Engine Methods ---
+    // --- Transformation Engine Methods (IN-MEMORY) ---
 
-    addRule(): void {
-        if (!this.canUseEngine()) return;
-        this.transformationRules.update(rules => [...rules, {
+    // Saves a new rule (IN-MEMORY ONLY)
+    async addRule(): Promise<void> {
+        
+        const newRule: TransformationRule = {
             id: crypto.randomUUID(),
-            name: `Rule ${rules.length + 1}`,
-            conditions: [{ column: this.columnConfig()[0]?.name || '', operator: 'eq', value: '', logic: 'AND' }],
-            actions: [{ targetColumn: this.columnConfig()[0]?.name || '', value: '' }]
-        }]);
+            name: `Rule ${this.transformationRules().length + 1}`,
+            conditions: [{ column: this.columnConfig()[0]?.name || 'field1', operator: 'eq', value: '', logic: 'AND' }],
+            actions: [{ targetColumn: this.columnConfig()[0]?.name || 'field1', value: '' }]
+        };
+        
+        this.transformationRules.update(rules => [...rules, newRule]);
+        console.warn(`MOCK DB: Added rule '${newRule.name}' to in-memory store.`);
     }
 
-    removeRule(index: number): void {
+    // Deletes a rule (IN-MEMORY ONLY)
+    async removeRule(index: number): Promise<void> {
+        const ruleToDelete = this.transformationRules()[index];
+        if (!ruleToDelete) return;
+        
         this.transformationRules.update(rules => rules.filter((_, i) => i !== index));
+        console.warn(`MOCK DB: Deleted rule '${ruleToDelete.name}' from in-memory store.`);
+    }
+
+    // Updates rule conditions/actions (IN-MEMORY ONLY)
+    updateRuleCondition(ruleIndex: number, condIndex: number, field: keyof RuleCondition, value: any): void {
+        this.transformationRules.update(rels => {
+            const newRules = [...rels];
+            if (newRules[ruleIndex] && newRules[ruleIndex].conditions[condIndex]) {
+                newRules[ruleIndex].conditions[condIndex] = { ...newRules[ruleIndex].conditions[condIndex], [field]: value };
+            }
+            return newRules;
+        });
+    }
+    
+    updateRuleAction(ruleIndex: number, actIndex: number, field: keyof RuleAction, value: any): void {
+        if (field === 'targetColumn') {
+            const rule = this.transformationRules()[ruleIndex];
+            const isDuplicate = rule.actions.some((action, i) => i !== actIndex && action.targetColumn === value);
+            if (isDuplicate) {
+                console.error(`ERROR: Column '${value}' is already a target in this rule.`);
+                return;
+            }
+        }
+        
+        this.transformationRules.update(rels => {
+            const newRules = [...rels];
+            if (newRules[ruleIndex] && newRules[ruleIndex].actions[actIndex]) {
+                newRules[ruleIndex].actions[actIndex] = { ...newRules[ruleIndex].actions[actIndex], [field]: value };
+            }
+            return newRules;
+        });
     }
 
     addRuleCondition(ruleIndex: number): void {
         this.transformationRules.update(rules => {
             const newRules = [...rules];
-            newRules[ruleIndex].conditions.push({ column: newRules[ruleIndex].conditions[0]?.column || '', operator: 'eq', value: '', logic: 'AND' });
+            const firstColumn = this.columnConfig()[0]?.name || 'field1';
+            newRules[ruleIndex].conditions.push({ column: firstColumn, operator: 'eq', value: '', logic: 'AND' });
             return newRules;
         });
     }
@@ -1921,7 +2528,6 @@ export class App implements OnInit {
         this.transformationRules.update(rules => {
             const newRules = [...rules];
             newRules[ruleIndex].conditions = newRules[ruleIndex].conditions.filter((_, i) => i !== condIndex);
-            // Ensure first condition remains AND for display purposes, but it's ignored in logic
             if (newRules[ruleIndex].conditions.length > 0) {
                  newRules[ruleIndex].conditions[0].logic = 'AND';
             }
@@ -1929,18 +2535,11 @@ export class App implements OnInit {
         });
     }
 
-    updateRuleCondition(ruleIndex: number, condIndex: number, field: keyof RuleCondition, value: any): void {
-        this.transformationRules.update(rules => {
-            const newRules = [...rules];
-            newRules[ruleIndex].conditions[condIndex] = { ...newRules[ruleIndex].conditions[condIndex], [field]: value };
-            return newRules;
-        });
-    }
-
     addRuleAction(ruleIndex: number): void {
         this.transformationRules.update(rules => {
             const newRules = [...rules];
-            newRules[ruleIndex].actions.push({ targetColumn: newRules[ruleIndex].actions[0]?.targetColumn || '', value: '' });
+            const firstColumn = this.columnConfig()[0]?.name || 'field1';
+            newRules[ruleIndex].actions.push({ targetColumn: firstColumn, value: '' });
             return newRules;
         });
     }
@@ -1953,42 +2552,24 @@ export class App implements OnInit {
         });
     }
     
-    updateRuleAction(ruleIndex: number, actIndex: number, field: keyof RuleAction, value: any): void {
-        if (field === 'targetColumn') {
-            const isDuplicate = this.checkDuplicateActionColumns(ruleIndex, value);
-            if (isDuplicate) {
-                console.error(`ERROR: Column '${value}' is already a target in this rule.`);
-                return;
-            }
-        }
-        
-        this.transformationRules.update(rules => {
-            const newRules = [...rules];
-            newRules[ruleIndex].actions[actIndex] = { ...newRules[ruleIndex].actions[actIndex], [field]: value };
-            return newRules;
-        });
-    }
-
-    private checkDuplicateActionColumns(ruleIndex: number, targetCol: string): boolean {
-        const rule = this.transformationRules()[ruleIndex];
-        return rule.actions.some(action => action.targetColumn === targetCol);
-    }
-    
-    // Rule Persistence
     saveRulesToFile(): void {
-        const jsonString = JSON.stringify(this.transformationRules(), null, 2);
+        const rulesToSave = this.transformationRules().map(rule => {
+            const { id, ...rest } = rule;
+            return rest;
+        });
+        
+        const jsonString = JSON.stringify(rulesToSave, null, 2);
         const blob = new Blob([jsonString], { type: 'application/json' });
         const url = URL.createObjectURL(blob);
         
         const a = document.createElement('a');
         a.href = url;
-        a.download = 'wabbat_rule_set_' + new Date().toISOString().slice(0, 10) + '.json';
+        a.download = 'configflow_rule_set_' + new Date().toISOString().slice(0, 10) + '.json';
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
-        
-        // alert('Rule set saved successfully.'); // Removed alert to follow instruction
+        console.warn("Rule set downloaded successfully.");
     }
     
     loadRulesFromFile(): void {
@@ -2001,18 +2582,20 @@ export class App implements OnInit {
 
             try {
                 const text = await file.text();
-                const json: TransformationRule[] = JSON.parse(text);
+                const json: TransformationRule[] = JSON.parse(text).map((rule: Omit<TransformationRule, 'id'>) => ({
+                    ...rule,
+                    id: crypto.randomUUID()
+                }));
 
                 if (!Array.isArray(json) || json.length === 0 || !json[0].conditions || !json[0].actions) {
-                    throw new Error("Invalid Rule Set format.");
+                    throw new Error("Invalid Rule Set format. Must be an array of rules with conditions and actions.");
                 }
 
                 this.transformationRules.set(json);
-                // alert(`Successfully loaded ${json.length} rules.`); // Removed alert to follow instruction
+                console.warn(`Successfully loaded ${json.length} rules into in-memory store.`);
 
             } catch (error) {
                 console.error("Load rules failed:", error);
-                // alert(`Load rules failed: ${error.message}`); // Removed alert to follow instruction
             }
         };
         input.click();
@@ -2020,7 +2603,6 @@ export class App implements OnInit {
 
     // Rule Application
     applyAllRules(): void {
-        if (!this.canUseEngine()) return;
         this.loadingMessage.set('Applying transformation rules...');
         this.isLoading.set(true);
 
@@ -2039,15 +2621,14 @@ export class App implements OnInit {
 
         this.dataRows.set(rows);
         this.isLoading.set(false);
-        // alert('Transformation complete! Check Data Grid tab for results.'); // Removed alert to follow instruction
+        console.warn("Transformation complete. Check Data Grid tab for results.");
     }
     
     private checkConditions(row: DataRow, conditions: RuleCondition[]): boolean {
         if (conditions.length === 0) return true;
 
-        let overallResult = false;
-        let groupResult = true;
-        let lastLogic = 'AND';
+        let overallResult = true;
+        let lastLogic: 'AND' | 'OR' = 'AND';
 
         for (let i = 0; i < conditions.length; i++) {
             const cond = conditions[i];
@@ -2057,27 +2638,17 @@ export class App implements OnInit {
 
             if (i === 0) {
                 overallResult = conditionMet;
-                groupResult = conditionMet;
-                lastLogic = currentLogic;
-                continue;
-            }
-
-            if (currentLogic === 'AND') {
-                groupResult = groupResult && conditionMet;
-            } else if (currentLogic === 'OR') {
-                if (lastLogic === 'AND') {
-                    // Start new OR group
-                    overallResult = overallResult || groupResult;
-                    groupResult = conditionMet;
-                } else {
-                    // Continue OR group
-                    groupResult = groupResult || conditionMet;
+            } else {
+                if (currentLogic === 'AND') {
+                    overallResult = overallResult && conditionMet;
+                } else if (currentLogic === 'OR') {
+                    overallResult = overallResult || conditionMet;
                 }
             }
             lastLogic = currentLogic;
         }
 
-        return overallResult || groupResult; // Final check for the last group
+        return overallResult; 
     }
     
     private evaluateCondition(rowValue: any, operator: string, value: string): boolean {
@@ -2093,8 +2664,8 @@ export class App implements OnInit {
             case 'lt': return parseFloat(rowString) < parseFloat(condString);
             case 'in': 
                 if (condString.includes('*')) {
-                    // Wildcard 'includes' logic
-                    const regex = new RegExp('^' + condString.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\\\*/g, '.*') + '$', 'i');
+                    const regexString = '^' + condString.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\\\*/g, '.*') + '$';
+                    const regex = new RegExp(regexString, 'i');
                     return regex.test(rowString);
                 }
                 return rowString.includes(condString);
@@ -2107,51 +2678,31 @@ export class App implements OnInit {
         let newRow = { ...row };
         for (const action of actions) {
             const targetCol = action.targetColumn;
-            const formula = action.value;
+            const formula = action.value.trim();
 
-            // Simple check for formula vs literal value
-            if (formula.match(/[\+\-\*\/]/) && this.columnConfig().some(col => formula.includes(col.name))) {
-                // Formula Logic (Simple Parser)
+            if (formula.includes('{{') && formula.includes('}}') && formula.match(/[\+\-\*\/]/)) {
+                
                 try {
-                    let calculatedValue: any = formula; // Default to string if calculation fails
-                    
-                    // Simple regex to find column names (variables) in the formula
-                    const columnNamesInFormula = formula.match(/{{\s*(\w+)\s*}}/g)?.map(match => match.replace(/\{\{\s*|\s*\}\}/g, ''));
                     let expression = formula;
+                    
+                    const columnNamesInFormula = expression.match(/\{\{\s*(\w+)\s*\}\}/g);
 
-                    // Substitute column names with their numeric values (default to 0 if non-numeric)
                     if (columnNamesInFormula) {
-                        for (const colName of columnNamesInFormula) {
-                             const colValue = parseFloat(newRow[colName]) || 0;
-                             expression = expression.replace(new RegExp(`{{\\s*${colName}\\s*}}`, 'g'), colValue.toString());
+                        for (const match of columnNamesInFormula) {
+                            const colName = match.replace(/\{\{\s*|\s*\}\}/g, '');
+                            const colValue = parseFloat(newRow[colName]) || 0;
+                            expression = expression.replace(new RegExp(match, 'g'), colValue.toString());
                         }
-                    }
-
-                    // Basic arithmetic simulation
-                    const match = expression.match(/(\d+\.?\d*)\s*([\+\-\*\/])\s*(\d+\.?\d*)/);
-                    if (match) {
-                        const num1 = parseFloat(match[1]);
-                        const operator = match[2];
-                        const num2 = parseFloat(match[3]);
-                        
-                        switch(operator) {
-                            case '+': calculatedValue = num1 + num2; break;
-                            case '-': calculatedValue = num1 - num2; break;
-                            case '*': calculatedValue = num1 * num2; break;
-                            case '/': calculatedValue = num1 / num2; break;
-                        }
-                    } else {
-                         calculatedValue = formula;
                     }
                     
-                    newRow[targetCol] = calculatedValue;
+                    const result = new Function(`return ${expression}`)();
+                    newRow[targetCol] = isFinite(result) ? result : formula;
 
                 } catch (e) {
-                    console.error(`Rule action failed for column ${targetCol}:`, e);
-                    newRow[targetCol] = formula; // Fallback to literal string if calculation fails
+                    console.error(`Rule action formula failed for column ${targetCol}: ${e}`);
+                    newRow[targetCol] = formula;
                 }
             } else {
-                // Literal Value
                 newRow[targetCol] = formula;
             }
         }
@@ -2159,39 +2710,53 @@ export class App implements OnInit {
     }
 
 
-    // --- API Configuration Methods ---
+    // --- API Configuration Methods (IN-MEMORY ONLY) ---
     
-    addApiConfig(): void {
-        this.apiConfigList.update(configs => [...configs, {
+    async addApiConfig(): Promise<void> {
+        
+        const newConfig: ApiConfig = {
             id: crypto.randomUUID(),
-            columnName: this.columnConfig()[0]?.name || '',
+            columnName: this.columnConfig()[0]?.name || 'field1',
             apiName: '',
             mapToColumn: '',
-        }]);
+        };
+
+        this.apiConfigList.update(configs => [...configs, newConfig]);
+        console.warn(`MOCK DB: Added API config '${newConfig.id}' to in-memory store.`);
     }
 
-    removeApiConfig(index: number): void {
+    async removeApiConfig(index: number): Promise<void> {
+        
+        const configToDelete = this.apiConfigList()[index];
+        if (!configToDelete) return;
+        
         this.apiConfigList.update(configs => configs.filter((_, i) => i !== index));
-        // TODO: Persist deletion to Firestore
+        console.warn(`MOCK DB: Deleted API config '${configToDelete.id}' from in-memory store.`);
     }
 
-    updateApiConfig(index: number, field: keyof ApiConfig, value: any): void {
+    async updateApiConfig(index: number, field: keyof ApiConfig, value: any): Promise<void> {
+        
+        const configToUpdate = this.apiConfigList()[index];
+        if (!configToUpdate) return;
+        
         this.apiConfigList.update(configs => configs.map((config, i) =>
             i === index ? { ...config, [field]: value } : config
         ));
-        // TODO: Persist update to Firestore
+        console.warn(`MOCK DB: Updated API config '${configToUpdate.id}' in-memory store.`);
     }
 
     // --- Row Detail Modal Methods ---
 
     openDetailModal(row: DataRow): void {
         this.detailModal.set({
-            isOpen: true,
+            isOpen: false, // Default to closed unless we explicitly run the API lookup
             row: row,
             tab: 'detail',
             apiResponse: '',
             apiConfig: null,
         });
+        // Wait a tick to ensure the modal opens after setting state
+        setTimeout(() => this.detailModal.update(state => ({ ...state, isOpen: true })), 0);
     }
 
     closeDetailModal(): void {
@@ -2218,7 +2783,7 @@ export class App implements OnInit {
         const row = modalState.row;
         const apiConfig = modalState.apiConfig;
 
-        if (!row || !apiConfig || !this.canUseApi()) return;
+        if (!row || !apiConfig) return;
 
         this.loadingMessage.set(`Running API lookup for column '${apiConfig.columnName}'...`);
         this.isLoading.set(true);
@@ -2249,7 +2814,7 @@ export class App implements OnInit {
     
     runBulkApiCall(): void {
         const config = this.apiConfigList()[0]; // Use the first config for simplicity
-        if (!config || !this.canUseApi()) return;
+        if (!config || !this.dataRows().length) return;
 
         this.loadingMessage.set(`Running bulk API lookup for column '${config.columnName}'...`);
         this.isLoading.set(true);
@@ -2297,108 +2862,92 @@ export class App implements OnInit {
     }
 
 
-    // --- Profile Persistence ---
+    // --- Profile Persistence (MOCKED) ---
 
     async updateProfileField(field: keyof UserProfile, value: any): Promise<void> {
         this.loadingMessage.set('Saving profile changes...');
         this.isLoading.set(true);
         
-        const userId = this.currentProfile().userId;
-        const userDocRef = doc(this.db, 'artifacts', this.appId(), 'users', userId, 'profile', 'data');
+        this.currentProfile.update(profile => ({ ...profile, [field]: value }));
         
-        try {
-            await setDoc(userDocRef, { [field]: value }, { merge: true });
-            this.currentProfile.update(profile => ({ ...profile, [field]: value }));
-            this.loadingMessage.set('Profile updated successfully.');
-        } catch (error) {
-            console.error("Error updating profile:", error);
-            this.loadingMessage.set('Failed to save profile changes.');
-        } finally {
-            this.isLoading.set(false);
-        }
+        console.warn(`MOCK DB: Updated profile field '${field}' to '${value}'. Persistence skipped.`);
+        this.loadingMessage.set('Profile updated successfully.');
+        this.isLoading.set(false);
     }
     
     async saveProfileChanges(): Promise<void> {
         this.loadingMessage.set('Saving all API config fields...');
         this.isLoading.set(true);
         
-        const userId = this.currentProfile().userId;
-        const userDocRef = doc(this.db, 'artifacts', this.appId(), 'users', userId, 'profile', 'data');
-        
-        try {
-            await setDoc(userDocRef, {
-                apiBaseUrl: this.currentProfile().apiBaseUrl,
-                apiAuthToken: this.currentProfile().apiAuthToken,
-                apiEnvironment: this.currentProfile().apiEnvironment,
-            }, { merge: true });
-            this.loadingMessage.set('API Configuration saved successfully.');
-        } catch (error) {
-            console.error("Error saving API Config:", error);
-            this.loadingMessage.set('Failed to save API Configuration.');
-        } finally {
-            this.isLoading.set(false);
-        }
+        console.warn("MOCK DB: API Configuration saved successfully. Persistence skipped.");
+        this.loadingMessage.set('API Configuration saved successfully.');
+        this.isLoading.set(false);
     }
 
-    // --- Testimonial Methods ---
+    // --- Testimonial Methods (NOW IN-MEMORY MOCKED) ---
 
     async submitTestimonial(): Promise<void> {
-        if (!this.currentProfile().isAuthenticated || !this.newTestimonialContent.trim()) return;
+        if (!this.newTestimonialContent.trim()) {
+            this.submissionMessage.set('Please enter content to submit a testimonial.');
+            setTimeout(() => this.submissionMessage.set(''), 5000);
+            return;
+        }
 
         this.isLoading.set(true);
         this.loadingMessage.set('Submitting testimonial...');
         
-        try {
-            const testimonial: Omit<Testimonial, 'id'> = {
-                userId: this.currentProfile().userId,
-                organizationName: this.currentProfile().organizationName,
-                content: this.newTestimonialContent.trim(),
-                isApproved: false, // Requires admin approval
-                timestamp: Date.now(),
-            };
+        const newTestimonial: Testimonial = {
+            id: crypto.randomUUID(),
+            userId: this.currentProfile().userId,
+            organizationName: this.currentProfile().organizationName,
+            content: this.newTestimonialContent.trim(),
+            isApproved: false, 
+            timestamp: Date.now(),
+        };
 
-            await setDoc(doc(collection(this.db, 'artifacts', this.appId(), 'public', 'testimonials')), testimonial);
-            this.newTestimonialContent = '';
-            this.submissionMessage = 'Thank you! Your testimonial has been submitted and is pending admin review.';
-        } catch (error) {
-            console.error("Testimonial submission failed:", error);
-            this.submissionMessage = `Error submitting testimonial: ${error.message}`;
-        } finally {
-            this.isLoading.set(false);
-            setTimeout(() => this.submissionMessage = '', 5000);
-        }
+        this.pendingTestimonials.update(t => [...t, newTestimonial]);
+        this.newTestimonialContent = '';
+        this.submissionMessage.set('Thank you! Your testimonial has been submitted and is pending admin review.');
+        
+        console.warn(`MOCK DB: Submitted testimonial ID ${newTestimonial.id} to in-memory pending list.`);
+
+        this.isLoading.set(false);
+        setTimeout(() => this.submissionMessage.set(''), 5000);
     }
     
     async approveTestimonial(id: string): Promise<void> {
-        if (!this.currentProfile().isAdmin) return;
         this.isLoading.set(true);
         this.loadingMessage.set('Approving testimonial...');
         
-        try {
-            const docRef = doc(this.db, 'artifacts', this.appId(), 'public', 'testimonials', id);
-            await setDoc(docRef, { isApproved: true }, { merge: true });
-        } catch (error) {
-            console.error("Approval failed:", error);
-            // alert(`Approval failed: ${error.message}`); // Removed alert to follow instruction
-        } finally {
-            this.isLoading.set(false);
+        // Find and move from pending to approved
+        let approvedItem: Testimonial | undefined;
+        this.pendingTestimonials.update(pending => {
+             const index = pending.findIndex(t => t.id === id);
+             if (index > -1) {
+                 approvedItem = pending[index];
+                 return pending.filter(t => t.id !== id);
+             }
+             return pending;
+        });
+
+        if (approvedItem) {
+             this.approvedTestimonials.update(approved => [...approved, { ...approvedItem!, isApproved: true }]);
+             console.warn(`MOCK DB: Approved testimonial ID ${id}. Moved to in-memory approved list.`);
         }
+
+        this.isLoading.set(false);
     }
     
     async deleteTestimonial(id: string): Promise<void> {
-        if (!this.currentProfile().isAdmin) return;
         this.isLoading.set(true);
         this.loadingMessage.set('Deleting testimonial...');
         
-        try {
-            const docRef = doc(this.db, 'artifacts', this.appId(), 'public', 'testimonials', id);
-            await deleteDoc(docRef);
-        } catch (error) {
-            console.error("Deletion failed:", error);
-            // alert(`Deletion failed: ${error.message}`); // Removed alert to follow instruction
-        } finally {
-            this.isLoading.set(false);
-        }
+        // Remove from both lists
+        this.pendingTestimonials.update(pending => pending.filter(t => t.id !== id));
+        this.approvedTestimonials.update(approved => approved.filter(t => t.id !== id));
+
+        console.warn(`MOCK DB: Deleted testimonial ID ${id}. Removed from in-memory lists.`);
+        this.isLoading.set(false);
     }
 
     // --- Utility Methods ---
@@ -2408,18 +2957,507 @@ export class App implements OnInit {
         const active = this.mainTab() === tabName 
             ? 'text-indigo-600 border-indigo-600 font-semibold' 
             : 'border-transparent text-gray-500';
-        const disabled = this.isTabDisabled(tabName)
-            ? 'opacity-50 cursor-not-allowed'
-            : '';
+        const disabled = '';
         return `${base} ${active} ${disabled}`;
     }
     
     isTabDisabled(tabName: string): boolean {
-        switch (tabName) {
-            case 'engine': return !this.canUseEngine();
-            case 'api-config': return !this.canUseApi();
-            case 'org-admin': return !this.currentProfile().isAdmin;
-            default: return false;
+        return false;
+    }
+
+    // --- Where Used? ERD Logic ---
+
+    // File import handler for Where Used? (MOCK)
+    importWhereUsedFile(fileId: 'B' | 'C'): void {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = 'application/json';
+        input.onchange = async (e) => {
+            const file = (e.target as HTMLInputElement).files?.[0];
+            if (!file) return;
+
+            try {
+                const text = await file.text();
+                const json: DataRow[] = JSON.parse(text);
+
+                if (!Array.isArray(json) || json.length === 0) {
+                    throw new Error("File must contain an array of objects.");
+                }
+
+                // Use a sample of keys from the first object
+                const keys = Object.keys(json[0] || {}).slice(0, 5); 
+                let name = `File ${fileId} (Ref ${fileId})`;
+
+                this.whereUsedFiles.update(files => ({
+                    ...files,
+                    [fileId]: { name: name, keys: keys, data: json, fileId: fileId }
+                }));
+                
+                // Automatically generate ERD visualization after import
+                this.generateErd();
+                
+                console.warn(`MOCK: Loaded ${keys.length} columns for ${fileId} file.`);
+
+            } catch (error) {
+                console.error(`Import ${fileId} failed:`, error);
+            } finally {
+                 // Clear out the selection logic state when a new file is imported
+                 this.selectedRelationalColumn.set(null);
+            }
+        };
+        input.click();
+    }
+    
+    refreshWhereUsedFileA(): void {
+        // This simulates File A being pulled directly from the current Rule Set (Data) Grid.
+        if (this.dataRows().length === 0) {
+             console.warn("Rule Set Data Grid is empty. Import data first.");
+             return;
         }
+
+        const data = this.dataRows();
+        const keys = this.columnConfig().map(c => c.name);
+        
+        this.whereUsedFiles.update(files => ({
+            ...files,
+            ['A']: { name: 'File A (Rule Set - LIVE)', keys: keys, data: data, fileId: 'A' }
+        }));
+        
+        this.generateErd();
+        console.warn("File A (Rule Set) refreshed from Data Grid.");
+    }
+    
+    // Logic to generate the mock ERD diagram structure
+    generateErd(): void {
+        const nodes: ErDiagramNode[] = [];
+        const files = this.whereUsedFiles();
+
+        // FIX: Ensure all required files have columns before attempting generation
+        if (files.A.keys.length === 0 || files.B.keys.length === 0 || files.C.keys.length === 0) {
+            this.erDiagramNodes.set([]);
+            return;
+        }
+
+        // Helper to add nodes
+        const addNodes = (fileId: 'A' | 'B' | 'C', keys: string[], startX: number, type: 'rules' | 'source' | 'target') => {
+            keys.forEach((col, i) => {
+                nodes.push({
+                    id: `${fileId}${i + 1}-${col}`,
+                    type: type,
+                    name: col,
+                    x: startX,
+                    y: 50 + (i * 80),
+                    connections: []
+                });
+            });
+        };
+        
+        addNodes('A', files.A.keys, 50, 'source'); // File A (Rule Set) on the left
+        addNodes('B', files.B.keys, 350, 'rules'); // File B (Reference 1) in the center
+        addNodes('C', files.C.keys, 650, 'target'); // File C (Reference 2) on the right
+
+
+        // MOCK CONNECTION LOGIC (A.JobID -> B.JobID -> C.JobID)
+        const mockConnections = [
+            { sourceKey: 'JobID', sourceFile: 'A', targetKey: 'JobID', targetFile: 'B', type: 'Target' },
+            { sourceKey: 'JobID', sourceFile: 'B', targetKey: 'JobID', targetFile: 'C', type: 'Target' },
+        ];
+        
+        mockConnections.forEach(conn => {
+            const sourceNode = nodes.find(n => n.name === conn.sourceKey && n.id.startsWith(conn.sourceFile));
+            const targetNode = nodes.find(n => n.name === conn.targetKey && n.id.startsWith(conn.targetFile));
+
+            if (sourceNode && targetNode) {
+                sourceNode.connections.push({ targetId: targetNode.id, type: conn.type });
+                // Optional back connection for visual clarity
+                targetNode.connections.push({ targetId: sourceNode.id, type: conn.type === 'Source' ? 'Target' : 'Source' }); 
+            }
+        });
+
+
+        this.erDiagramNodes.set(nodes);
+        this.updateErdSize();
+        console.log("ERD Generated with Nodes:", nodes);
+    }
+
+    // Drag Handler
+    onNodeDrag(event: CdkDragMove<any>, nodeId: string): void {
+        const element = event.source.getRootElement();
+        this.erDiagramNodes.update(nodes => nodes.map(node => {
+            if (node.id === nodeId) {
+                // Update node position based on the drag event
+                node.x = element.offsetLeft;
+                node.y = element.offsetTop;
+            }
+            return node;
+        }));
+    }
+
+    // Utility to calculate line start/end coordinates for the SVG
+    getLineCoordinates(sourceNode: ErDiagramNode, targetNodeId: string): { x1: number, y1: number, x2: number, y2: number } | null {
+        const targetNode = this.erDiagramNodes().find(n => n.id === targetNodeId);
+        if (!targetNode) return null;
+
+        const nodeWidth = 180; // Approximate node width (from CSS min-width)
+        const nodeHeight = 60; // Approximate node height
+
+        let x1 = sourceNode.x + nodeWidth / 2;
+        let y1 = sourceNode.y + nodeHeight / 2;
+
+        let x2 = targetNode.x + nodeWidth / 2;
+        let y2 = targetNode.y + nodeHeight / 2;
+        
+        // Connect from the appropriate edge
+        if (targetNode.x > sourceNode.x) {
+            x1 = sourceNode.x + nodeWidth;
+            x2 = targetNode.x;
+        } else {
+            x1 = sourceNode.x;
+            x2 = targetNode.x + nodeWidth;
+        }
+
+        return { x1, y1, x2, y2 };
+    }
+
+    // MOCK: Dynamically set the SVG size based on the largest node coordinates
+    updateErdSize(): void {
+        if (!this.erdContainer) return; // FIX: Ensure ViewChild element is defined before accessing nativeElement
+
+        const containerElement = this.erdContainer.nativeElement;
+        const currentWidth = containerElement.clientWidth;
+        const currentHeight = containerElement.clientHeight;
+
+        const nodes = this.erDiagramNodes();
+        
+        let maxX = currentWidth;
+        let maxY = currentHeight;
+
+        // Calculate max extent needed for the container based on node positions
+        if (nodes.length > 0) {
+            // Add padding (200px for width, 100px for height)
+            const calculatedMaxX = Math.max(...nodes.map(n => n.x + 200)); 
+            const calculatedMaxY = Math.max(...nodes.map(n => n.y + 100)); 
+            
+            // The SVG size must be at least the size of the container, but extendable if nodes are dragged outside the initial view.
+            maxX = Math.max(currentWidth, calculatedMaxX);
+            maxY = Math.max(currentHeight, calculatedMaxY);
+        }
+
+        this.erdSize.set({ 
+            width: maxX, 
+            height: maxY 
+        });
+    }
+
+    // --- Where Used? Map Detail Logic ---
+
+    updateWhereUsedMapDetail(field: keyof WhereUsedMapDetails, value: string): void {
+        this.whereUsedMapDetails.update(details => ({
+            ...details,
+            [field]: value
+        }));
+    }
+
+    saveWhereUsedMap(): void {
+        const details = this.whereUsedMapDetails();
+        console.warn(`MOCK DB: Where Used Map '${details?.mapName || 'Untitled'}' saved to in-memory store (Persistence skipped).`);
+        this.loadingMessage.set(`Dependency Map '${details?.mapName || 'Untitled'}' saved successfully.`);
+        this.isLoading.set(true);
+        setTimeout(() => this.isLoading.set(false), 800);
+    }
+
+    // --- Relational CRTs Logic ---
+
+    // File import handler for Relational CRTs (MOCK)
+    importRelationalFile(fileId: 'A' | 'B' | 'C'): void {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = 'application/json';
+        input.onchange = async (e) => {
+            const file = (e.target as HTMLInputElement).files?.[0];
+            if (!file) return;
+
+            try {
+                const text = await file.text();
+                const json: DataRow[] = JSON.parse(text);
+
+                if (!Array.isArray(json) || json.length === 0) {
+                    throw new Error("File must contain an array of objects.");
+                }
+
+                // If importing File A (Rule Set Data), update main data grid
+                if (fileId === 'A') {
+                    // Update main data grid with imported Rule Set data
+                    this.dataRows.set(json.map(row => ({ ...row, id: row.id || crypto.randomUUID() })));
+                    this.columnConfig.set(Object.keys(json[0] || {}).map(key => ({
+                         name: key, isVisible: true, isUniqueKey: key === 'EmployeeID', isSortAsc: null, sortOrder: -1
+                    })));
+                }
+
+                // Use a sample of keys from the first object
+                const keys = Object.keys(json[0] || {}).slice(0, 5); 
+                let name = `File ${fileId} (Ref ${fileId})`;
+                if (fileId === 'A') name = 'File A (Rule Set)';
+
+                this.whereUsedFiles.update(files => ({
+                    ...files,
+                    [fileId]: { name: name, keys: keys, data: json, fileId: fileId }
+                }));
+                
+                console.warn(`MOCK: Loaded ${keys.length} columns and ${json.length} rows for Relational CRT File ${fileId}.`);
+
+            } catch (error) {
+                console.error(`Import Relational File ${fileId} failed:`, error);
+            } finally {
+                 this.selectedRelationalColumn.set(null);
+            }
+        };
+        input.click();
+    }
+
+
+    // Updates the shared map details (Name/Description) for CRTs
+    updateMapDetail(field: keyof RelationshipDefinition, value: string): void {
+        this.relationalRelationships.update(rels => {
+            if (rels.length === 0) {
+                const newRel: RelationshipDefinition = {
+                    id: crypto.randomUUID(),
+                    mapName: 'Untitled Map',
+                    mapDescription: '',
+                    fileAColumn: '', fileBColumn: '', fileBRelation: '1:M',
+                    fileCColumn: '', fileCRelation: '0:1'
+                };
+                (newRel as any)[field] = value;
+                return [newRel];
+            }
+            const updatedRels = [...rels];
+            (updatedRels[0] as any)[field] = value;
+            return updatedRels;
+        });
+    }
+
+    addRelationship(): void {
+        this.relationalRelationships.update(rels => {
+            const files = this.relationalFiles();
+            const firstRel = rels[0];
+
+            const mapName = firstRel?.mapName || 'Untitled Map';
+            const mapDescription = firstRel?.mapDescription || '';
+
+            const newRel: RelationshipDefinition = {
+                id: crypto.randomUUID(),
+                mapName: mapName,
+                mapDescription: mapDescription,
+                fileAColumn: files.A.keys[0] || '',
+                fileBColumn: files.B.keys[0] || '',
+                fileBRelation: '1:M',
+                fileCColumn: files.C.keys[0] || '',
+                fileCRelation: '0:1',
+            };
+            
+            if (rels.length === 0) {
+                 return [newRel];
+            }
+            return [...rels, newRel];
+        });
+        this.relationalValidationResult.set({ status: 'IDLE', errors: [] });
+    }
+
+    removeRelationship(index: number): void {
+        this.relationalRelationships.update(rels => rels.filter((_, i) => i !== index));
+        this.relationalValidationResult.set({ status: 'IDLE', errors: [] });
+    }
+    
+    // Updates specific column/relation details using dropdown value change
+    updateRelationship(index: number, field: keyof RelationshipDefinition, value: string): void {
+        this.relationalRelationships.update(rels => {
+            const updatedRels = [...rels];
+            (updatedRels[index] as any)[field] = value;
+            return updatedRels;
+        });
+        this.relationalValidationResult.set({ status: 'IDLE', errors: [] });
+    }
+
+    // New: Handle click selection for drag-and-click mapping
+    selectRelationalColumn(fileId: 'A' | 'B' | 'C', columnName: string): void {
+        const currentSelection = this.selectedRelationalColumn();
+
+        if (currentSelection?.fileId === fileId && currentSelection.columnName === columnName) {
+            // Deselect if clicking the active column again
+            this.selectedRelationalColumn.set(null);
+            return;
+        }
+
+        if (!currentSelection) {
+            // First click: set source
+            this.selectedRelationalColumn.set({ fileId, columnName });
+            return;
+        }
+
+        // Second click: Define link and reset selection
+        this.linkRelationalColumns(currentSelection, { fileId, columnName });
+        this.selectedRelationalColumn.set(null);
+    }
+    
+    // New: Logic to create or update a relationship link between two selected columns
+    private linkRelationalColumns(
+        source: { fileId: 'A' | 'B' | 'C', columnName: string }, 
+        target: { fileId: 'A' | 'B' | 'C', columnName: string }
+    ): void {
+        // Ensure source and target are not the same file
+        if (source.fileId === target.fileId) {
+             console.error("Cannot link columns within the same file.");
+             return;
+        }
+        
+        // Determine the link direction (A->B or B->C)
+        let sourceColField: keyof RelationshipDefinition = 'fileAColumn';
+        let targetColField: keyof RelationshipDefinition = 'fileBColumn';
+        
+        // Determine which fields in RelationshipDefinition to update based on source/target files
+        // A->B link (Rule Set to Ref 1)
+        if (source.fileId === 'A' && target.fileId === 'B') {
+            sourceColField = 'fileAColumn';
+            targetColField = 'fileBColumn';
+        } 
+        // B->C link (Ref 1 to Ref 2)
+        else if (source.fileId === 'B' && target.fileId === 'C') {
+             sourceColField = 'fileBColumn'; 
+             targetColField = 'fileCColumn';
+        } else {
+             console.error(`Invalid link direction: Cannot link ${source.fileId} -> ${target.fileId}. Must be A->B or B->C only.`);
+             return;
+        }
+
+
+        this.relationalRelationships.update(rels => {
+            if (rels.length === 0) {
+                 this.addRelationship(); 
+                 return rels; 
+            }
+            
+            const updatedRels = [...rels];
+            const relIndex = 0; // Always update the first entry for this mock
+
+            // Set the columns based on the determined direction
+            (updatedRels[relIndex] as any)[sourceColField] = source.columnName;
+            (updatedRels[relIndex] as any)[targetColField] = target.columnName;
+
+
+            this.relationalValidationResult.set({ status: 'IDLE', errors: [] });
+            return updatedRels;
+        });
+
+        console.warn(`MOCK: Defined link ${source.fileId}.${source.columnName} -> ${target.fileId}.${target.columnName}`);
+    }
+
+
+    saveMap(): void {
+        const details = this.relationalRelationships()[0];
+        console.warn(`MOCK DB: Relational Map '${details?.mapName || 'Untitled'}' saved to in-memory store (Persistence skipped).`);
+        this.loadingMessage.set(`Relational Map '${details?.mapName || 'Untitled'}' saved successfully.`);
+        this.isLoading.set(true);
+        setTimeout(() => this.isLoading.set(false), 800);
+    }
+
+
+    // MOCK: Comprehensive Validation Logic
+    validateRelationships(): void {
+        this.isLoading.set(true);
+        this.loadingMessage.set('Running data integrity checks...');
+        
+        setTimeout(() => {
+            const relationships = this.relationalRelationships();
+            const files = this.relationalFiles();
+            const errors: string[] = [];
+
+            if (!this.isRelationalDataReady()) {
+                this.relationalValidationResult.set({ status: 'ERROR', errors: ['Cannot run validation: All configuration files (A, B, C) must be imported with data.'] });
+                this.isLoading.set(false);
+                return;
+            }
+
+            const getFileKeys = (fileId: 'A' | 'B' | 'C', column: string) => new Set(files[fileId].data.map(row => row[column]));
+            const isMandatory = (cardinality: string) => cardinality === '1:1' || cardinality === '1:M';
+            
+            for (const rel of relationships) {
+                // Skip validation if map is incomplete
+                if (!rel.fileAColumn || !rel.fileBColumn || !rel.fileCColumn) {
+                    errors.push(`Relationship Incomplete: Missing column selections in one or more tiers.`);
+                    continue; 
+                }
+
+                // ------------------------------------------------------------------
+                // Tier 1 & 2: A (Parent/Rule Set) -> B (Child/Reference 1)
+                const fileAKeys = getFileKeys('A', rel.fileAColumn);
+                const fileBForeignKeys = files.B.data.map(row => row[rel.fileBColumn]).filter(v => v !== undefined && v !== null && String(v).trim() !== '');
+
+                if (isMandatory(rel.fileBRelation)) {
+                    const missingBKeys = files.B.data.filter(row => !row[rel.fileBColumn] || String(row[rel.fileBColumn]).trim() === '');
+                    if (missingBKeys.length > 0) {
+                        errors.push(`A->B Mandatory Link Error: ${missingBKeys.length} rows in File B are missing a value in column '${rel.fileBColumn}'.`);
+                    }
+                }
+                
+                // Foreign Key Integrity (B's FK must exist in A's Primary Key column)
+                fileBForeignKeys.forEach((fk) => {
+                    if (!fileAKeys.has(fk)) {
+                         errors.push(`A->B Foreign Key Error: Value '${fk}' in File B:${rel.fileBColumn} does not exist in File A:${rel.fileAColumn}.`);
+                    }
+                });
+                
+                // Cardinality Check (1:1 checks on B foreign key)
+                if (rel.fileBRelation === '1:1') {
+                    const fkCounts: { [key: string]: number } = {};
+                    fileBForeignKeys.forEach(fk => { fkCounts[fk] = (fkCounts[fk] || 0) + 1; });
+                    for (const fk in fkCounts) {
+                        if (fkCounts[fk] > 1) {
+                            errors.push(`A->B Cardinality Error: Parent key '${fk}' in File A is referenced ${fkCounts[fk]} times in File B (should be 1:1).`);
+                        }
+                    }
+                }
+                
+                // ------------------------------------------------------------------
+                // Tier 2 & 3: B (Parent/Reference 1) -> C (Grandchild/Reference 2)
+                const fileBReferenceKeys = getFileKeys('B', rel.fileBColumn); // B now acts as parent
+                const fileCForeignKeys = files.C.data.map(row => row[rel.fileCColumn]).filter(v => v !== undefined && v !== null && String(v).trim() !== '');
+
+                if (isMandatory(rel.fileCRelation)) {
+                    const missingCKeys = files.C.data.filter(row => !row[rel.fileCColumn] || String(row[rel.fileCColumn]).trim() === '');
+                    if (missingCKeys.length > 0) {
+                         errors.push(`B->C Mandatory Link Error: ${missingCKeys.length} rows in File C are missing a value in column '${rel.fileCColumn}'.`);
+                    }
+                }
+                
+                // Foreign Key Integrity (C's FK must exist in B's Primary Key column)
+                fileCForeignKeys.forEach((fk) => {
+                    if (!fileBReferenceKeys.has(fk)) {
+                         errors.push(`B->C Foreign Key Error: Value '${fk}' in File C:${rel.fileCColumn} does not exist in File B:${rel.fileBColumn}.`);
+                    }
+                });
+                
+                // Cardinality Check (1:1 checks on C foreign key)
+                if (rel.fileCRelation === '1:1') {
+                    const fkCounts: { [key: string]: number } = {};
+                    fileCForeignKeys.forEach(fk => { fkCounts[fk] = (fkCounts[fk] || 0) + 1; });
+                    for (const fk in fkCounts) {
+                        if (fkCounts[fk] > 1) {
+                            errors.push(`B->C Cardinality Error: Parent key '${fk}' in File B is referenced ${fkCounts[fk]} times in File C (should be 1:1).`);
+                        }
+                    }
+                }
+            }
+
+            if (errors.length > 0) {
+                this.relationalValidationResult.set({ status: 'ERROR', errors });
+            } else {
+                this.relationalValidationResult.set({ status: 'OK', errors: ['All defined relationships are valid.'] });
+            }
+            
+            this.isLoading.set(false);
+            this.loadingMessage.set('Integrity check complete.');
+            console.log('Validation complete. Errors:', errors);
+
+        }, 1500);
     }
 }
