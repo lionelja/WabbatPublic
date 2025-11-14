@@ -3115,14 +3115,21 @@ export class App implements OnInit, AfterViewInit {
             case 'neq': return rowString !== condString;
             case 'gt': return parseFloat(rowString) > parseFloat(condString);
             case 'lt': return parseFloat(rowString) < parseFloat(condString);
-            case 'in': 
+            case 'in':
+                if (condString.includes(',')) {
+                    return condString.split(',').map(s => s.trim()).includes(rowString);
+                }
                 if (condString.includes('*')) {
                     const regexString = '^' + condString.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\\\*/g, '.*') + '$';
                     const regex = new RegExp(regexString, 'i');
                     return regex.test(rowString);
                 }
                 return rowString.includes(condString);
-            case 'nin': return !rowString.includes(condString);
+            case 'nin':
+                if (condString.includes(',')) {
+                    return !condString.split(',').map(s => s.trim()).includes(rowString);
+                }
+                return !rowString.includes(condString);
             default: return false;
         }
     }
